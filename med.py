@@ -3,7 +3,10 @@ import requests
 from flask import Flask, request, jsonify
 import logging
 import re
-
+#import to get env variables from env
+from dotenv import load_dotenv
+import os
+load_dotenv()
 app = Flask(__name__)
 
 # Configure logging
@@ -11,8 +14,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # LLM API endpoint and authorization
-LLM_API_URL = "http://203.112.158.104:5004/v1/chat/completions"
-LLM_AUTH_HEADER = "Bearer apex@#1"
+LLM_API_URL = os.getenv("LLM_API_URL")
+LLM_AUTH_HEADER = os.getenv("LLM_AUTH_HEADER")
 
 # Example cases for few-shot learning
 EXAMPLE_CASES = {
