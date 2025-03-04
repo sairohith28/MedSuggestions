@@ -3,9 +3,9 @@ import requests
 from flask import Flask, request, jsonify
 import logging
 import re
-#import to get env variables from env
 from dotenv import load_dotenv
 import os
+
 load_dotenv()
 app = Flask(__name__)
 
@@ -85,6 +85,20 @@ EXAMPLE_CASES = {
             "input": "Diagnosis: Hypertension. Vitals: BP 160/95 mmHg.",
             "output": {"date": "2025-03-05", "text": "Review in 1 week for blood pressure check and medication adjustment if needed."}
         }
+    ],
+    "diet_instructions": [
+        {
+            "input": "Diagnosis: Allergic asthma. Chief complaints: Persistent dry cough and mild dyspnea. Allergies: Dust and pollen.",
+            "output": "Increase hydration, avoid exposure to dust, dairy, and cold beverages, and consume antioxidant-rich foods"
+        },
+        {
+            "input": "Diagnosis: Osteoarthritis of knee. Chief complaints: High knee pain.",
+            "output": "Maintain a balanced diet, increase anti-inflammatory foods like turmeric and fish, avoid processed foods and excess sugar"
+        },
+        {
+            "input": "Diagnosis: Hypertension. Chief complaints: Headache, dizziness. Vitals: BP 160/95 mmHg.",
+            "output": "Reduce salt intake, avoid caffeine and alcohol, increase potassium-rich foods like bananas and leafy greens"
+        }
     ]
 }
 
@@ -116,7 +130,7 @@ def get_llm_suggestion(prompt):
             {"role": "user", "content": prompt}
         ],
         "max_tokens": 500,
-        "temperature": 0.2,  # Reduce randomness (range 0-1, lower=more deterministic)
+        "temperature": 0.2,
         "seed": 42  
     }
     
@@ -125,7 +139,6 @@ def get_llm_suggestion(prompt):
         response.raise_for_status()
         result = response.json()
         
-        # Extract the generated content
         if 'choices' in result and len(result['choices']) > 0:
             return result['choices'][0]['message']['content']
         else:
@@ -135,11 +148,50 @@ def get_llm_suggestion(prompt):
         logger.error(f"Error calling LLM API: {str(e)}")
         return None
 
+def get_icd11_diagnosis(diagnosis_name):
+    """
+    Fetch diagnosis name and ICD-11 code from the provided API based on diagnosis name.
+    """
+    try:
+        url = f"https://dev.apexcura.com/api/op/getDiagnosisList?searchText={diagnosis_name}"
+        response = requests.get(url)
+        response.raise_for_status()
+        result = response.json()
+        
+        if result.get("status") and result.get("data") and len(result["data"]) > 0:
+            top_result = result["data"][0]
+            return {"name": top_result["diagnosis"], "code": top_result["icdCode"]}
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching ICD-11 diagnosis: {str(e)}")
+        return None
+
+def predict_allergies(patient_data):
+    """
+    Predict potential allergies based on patient data.
+    """
+    allergies = patient_data.get('allergies', 'Not provided')
+    if allergies != 'Not provided':
+        return allergies
+    
+    complaints = patient_data.get('chief_complaints', '').lower()
+    history = patient_data.get('medical_history', '').lower()
+    predicted = []
+    
+    if 'cough' in complaints or 'dyspnea' in complaints or 'rhinitis' in history:
+        predicted.append("Dust")
+        predicted.append("Pollen")
+    if 'rash' in complaints or 'dermatitis' in history:
+        predicted.append("Nickel")
+    if 'abdominal pain' in complaints or 'diarrhea' in complaints:
+        predicted.append("Lactose")
+    
+    return ", ".join(predicted) if predicted else "None predicted"
+
 def extract_json_from_text(text):
     """
     Attempts to extract JSON from text that might contain explanations or other content.
     """
-    # Try to find JSON-like content enclosed in brackets
     json_pattern = r'\[.*\]|\{.*\}'
     match = re.search(json_pattern, text, re.DOTALL)
     
@@ -156,7 +208,6 @@ def generate_field_prompt(patient_data, field):
     """
     Generate prompt for a specific field based on available patient data with examples.
     """
-    
     base_context = f"""
 Based on the following patient information:
 - Chief complaints: {patient_data.get('chief_complaints', 'Not provided')}
@@ -165,9 +216,8 @@ Based on the following patient information:
 - Current medications: {patient_data.get('current_medications', 'Not provided')}
 - Vitals: {patient_data.get('vitals', 'Not provided')}
 """
-
-    if field == "medications" and "diagnosis" in patient_data and patient_data["diagnosis"]:
-        # Add diagnosis to context for medications
+    
+    if field in ["medications", "diet_instructions"] and "diagnosis" in patient_data and patient_data["diagnosis"]:
         if isinstance(patient_data["diagnosis"], list) and len(patient_data["diagnosis"]) > 0:
             diag = patient_data["diagnosis"][0].get("name", "")
             base_context += f"- Diagnosis: {diag}\n"
@@ -228,6 +278,17 @@ Your output MUST follow this exact format without any explanation or additional 
 {format_examples("followup")}
 
 Now, provide ONLY the followup plan in the format described above:
+""",
+
+        "diet_instructions": base_context + f"""
+I need you to provide ONLY a concise set of diet instructions for this patient.
+
+Your output MUST be a single string without any explanation or additional text.
+The instructions should be practical, relevant to the patient's condition, and 15-30 words long.
+
+{format_examples("diet_instructions")}
+
+Now, provide ONLY the diet instructions as a single string:
 """
     }
     
@@ -241,59 +302,43 @@ def process_field(field, suggestion):
         return None
         
     try:
-        # First try to extract any JSON content if it's embedded in text
         json_content = extract_json_from_text(suggestion)
         if json_content:
             return json_content
             
-        # Field-specific processing if JSON extraction failed
         if field == "diagnosis":
-            # Try to extract diagnosis and code from text
             match = re.search(r'([A-Z][0-9]+\.[0-9]+)', suggestion)
             code = match.group(1) if match else "Unknown"
-            
-            # Get the diagnosis name (first sentence or first line)
             name = suggestion.split('.')[0].strip()
-            if len(name) > 100:  # Too long, probably not just the name
+            if len(name) > 100:
                 name = name[:100] + "..."
-                
             return [{"code": code, "name": name}]
             
         elif field == "investigations":
-            # Return just a cleaned string
             return suggestion.strip().replace("\n", ", ")
             
         elif field == "medications":
-            # Try to extract medication names and instructions
             lines = suggestion.strip().split("\n")
             meds = []
-            
             for line in lines:
                 if ":" in line:
                     name, instructions = line.split(":", 1)
-                    meds.append({
-                        "name": name.strip(),
-                        "instructions": instructions.strip()
-                    })
-            
+                    meds.append({"name": name.strip(), "instructions": instructions.strip()})
             if meds:
                 return meds
-            else:
-                # Get first sentence as medication name, rest as instructions
-                parts = suggestion.split(".", 1)
-                return [{"name": parts[0].strip(), "instructions": parts[1].strip() if len(parts) > 1 else "As directed"}]
+            parts = suggestion.split(".", 1)
+            return [{"name": parts[0].strip(), "instructions": parts[1].strip() if len(parts) > 1 else "As directed"}]
                 
         elif field == "followup":
-            # Extract date if possible
             date_match = re.search(r'(\d{4}-\d{2}-\d{2})', suggestion)
             date = date_match.group(1) if date_match else "2025-03-15"
-            
-            # Use the suggestion text or extract key information
             text = suggestion.replace(date, "").strip() if date_match else suggestion.strip()
-            if len(text) > 200:  # Too verbose
+            if len(text) > 200:
                 text = text.split(".")[0] + "."
-                
             return {"date": date, "text": text}
+            
+        elif field == "diet_instructions":
+            return suggestion.strip()
             
         else:
             return suggestion.strip()
@@ -306,21 +351,22 @@ def process_json_data(data):
     """
     Process the input JSON data and return completed data with AI suggestions.
     """
-    # Deep copy of original data to avoid modifying the input
     result = data.copy() if data else {}
     
-    # Fields that need to be checked and potentially filled
-    fields_to_check = ["diagnosis", "investigations", "medications", "followup"]
+    # Fields to check and potentially fill
+    fields_to_check = ["diagnosis", "investigations", "medications", "followup", "diet_instructions"]
+    
+    # Predict allergies if not provided or needs fixing
+    if "allergies" not in data or data["allergies"] == "" or "predicted" in data["allergies"].lower():
+        result["allergies"] = predict_allergies(data)
     
     for field in fields_to_check:
-        # Check if the field is missing or incomplete
         field_empty = (field not in data or not data[field] or 
                       (isinstance(data.get(field), str) and data[field].strip() == "") or
                       (isinstance(data.get(field), list) and len(data[field]) == 0) or
                       (isinstance(data.get(field), dict) and 
                        all(not v for v in data[field].values())))
                        
-        # Also check if the existing field needs fixing (containing thinking aloud text)
         field_needs_fixing = False
         if field in data:
             if field == "diagnosis" and isinstance(data.get(field), list) and len(data[field]) > 0:
@@ -329,35 +375,38 @@ def process_json_data(data):
                     field_needs_fixing = True
             elif field == "medications" and isinstance(data.get(field), list) and len(data[field]) > 0:
                 for med in data[field]:
-                    if not isinstance(med, dict):
-                        field_needs_fixing = True
-                        break
-                    if "name" in med and ("I'm confident" in med["name"] or "Final say" in med["name"]):
+                    if not isinstance(med, dict) or ("I'm confident" in med.get("name", "")):
                         field_needs_fixing = True
                         break
             elif field == "followup" and isinstance(data.get(field), dict):
                 followup_text = data[field].get("text", "")
                 if followup_text.startswith("Alright, let's think") or "step by step" in followup_text.lower():
                     field_needs_fixing = True
+            elif field == "diet_instructions" and isinstance(data.get(field), str):
+                if "thinking" in data[field].lower() or len(data[field]) > 100:
+                    field_needs_fixing = True
                        
         if field_empty or field_needs_fixing:
             logger.info(f"Field '{field}' is missing, empty, or needs fixing. Generating suggestion.")
             
-            # Generate prompt for the specific field
-            prompt = generate_field_prompt(data, field)
+            prompt = generate_field_prompt(result, field)
             if not prompt:
                 continue
                 
-            # Get suggestion from the LLM
             suggestion = get_llm_suggestion(prompt)
             if not suggestion:
                 continue
                 
-            # Process the suggestion based on the field
             processed_value = process_field(field, suggestion)
-            
             if processed_value is not None:
                 result[field] = processed_value
+    
+    # Update diagnosis with API-provided name and ICD-11 code
+    if "diagnosis" in result and isinstance(result["diagnosis"], list) and len(result["diagnosis"]) > 0:
+        diag_name = result["diagnosis"][0].get("name", "")
+        api_diagnosis = get_icd11_diagnosis(diag_name)
+        if api_diagnosis:
+            result["diagnosis"] = [{"name": api_diagnosis["name"], "code": api_diagnosis["code"]}]
     
     return result
 
@@ -371,9 +420,7 @@ def suggest():
         if not data:
             return jsonify({"error": "No data provided"}), 400
             
-        # Process the data and get suggestions
         completed_data = process_json_data(data)
-        
         return jsonify(completed_data)
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
