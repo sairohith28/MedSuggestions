@@ -96,6 +96,64 @@ def get_llm_suggestion(prompt):
         logger.error(f"Error calling LLM API: {str(e)}")
         return None
 
+def validate_chief_complaints(chief_complaints):
+    """Validate if the chief complaints are specific and medically relevant using LLM"""
+    if not chief_complaints or not isinstance(chief_complaints, str) or not chief_complaints.strip():
+        logger.info(f"Chief complaint is empty or invalid: {chief_complaints}")
+        return False
+
+    prompt = f"""
+You are a medical AI assistant specialized in validating chief complaints. Your task is to determine if a patient's chief complaint is valid for medical documentation.
+
+A chief complaint is VALID if it:
+- Describes specific symptoms (e.g., fever, pain, cough)
+- Mentions medical conditions (e.g., hypertension, diabetes)
+- Describes injuries or trauma (e.g., fall, accident)
+- Includes phrases like "the patient has" followed by symptoms
+- Can be brief but must contain specific medical information
+
+A chief complaint is INVALID if it:
+- Is vague without specific symptoms (e.g., "feeling unwell", "not good")
+- Contains no medical information
+- Is a greeting or procedural text (e.g., "need appointment", "hello")
+- Contains only administrative information
+
+You must respond with ONLY "true" or "false".
+
+Examples of VALID chief complaints:
+- "The patient has high fever" → true
+- "High fever" → true
+- "The patient has chest pain and difficulty breathing" → true
+- "Headache for 3 days" → true
+- "The patient has cough and cold" → true
+- "The patient has diabetes" → true
+- "Abdominal pain since yesterday" → true
+- "Patient fell and injured knee" → true
+
+Examples of INVALID chief complaints:
+- "The patient is here for checkup" → false
+- "Need medicine" → false
+- "Not feeling well" → false
+- "Hello doctor" → false
+- "Need appointment" → false
+- "The patient is here" → false
+- "Review" → false
+
+Chief complaint to validate: "{chief_complaints}"
+
+Valid (true) or Invalid (false):
+"""
+    llm_output = get_llm_suggestion(prompt)
+    if llm_output:
+        logger.info(f"LLM validation result for '{chief_complaints}': {llm_output}")
+        # Extract just the true/false from the response, ignoring any explanations
+        result = "true" in llm_output.strip().lower()
+        if not result:
+            logger.info(f"Chief complaint '{chief_complaints}' deemed invalid by LLM")
+        return result
+    else:
+        logger.info(f"LLM failed for '{chief_complaints}', returning False")
+        return False
 def get_icd11_diagnosis(diagnosis_name):
     """Fetch ICD-11 diagnosis from API"""
     try:
@@ -157,7 +215,6 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
                 preferences["medications"] = visit["medications"]
             
             if similarity > 0.4:
-                # Keep existing logic for other fields
                 if "diagnosis" in visit and visit["diagnosis"]:
                     preferences["diagnosis"].extend(visit["diagnosis"])
                 if "investigations" in visit and visit["investigations"]:
@@ -176,31 +233,29 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
         return {}
 
 def extract_patient_details(past_visits):
-    """Extract patient sections from the last visit only"""
+    """Extract patient sections from the last visit only, wrapping text in array of objects"""
     details = {
-        "medical_history": "",
-        "personal_history": "",
-        "family_history": "",
-        "current_medications": "",
-        "allergies": ""
+        "medical_history": [{"text": ""}],
+        "personal_history": [{"text": ""}],
+        "family_history": [{"text": ""}],
+        "current_medications": [{"text": ""}],
+        "allergies": [{"text": ""}]
     }
     
     if not past_visits:
         logger.info("No past visits found for patient details extraction")
         return details
 
-    # Use only the most recent visit
     latest_visit = past_visits[0]
-    details["medical_history"] = latest_visit.get("medical_history", {}).get("content", "") if isinstance(latest_visit.get("medical_history"), dict) else latest_visit.get("medical_history", "")
-    details["personal_history"] = latest_visit.get("personal_history", {}).get("content", "") if isinstance(latest_visit.get("personal_history"), dict) else latest_visit.get("personal_history", "")
-    details["family_history"] = latest_visit.get("family_history", {}).get("content", "") if isinstance(latest_visit.get("family_history"), dict) else latest_visit.get("family_history", "")
-    details["current_medications"] = latest_visit.get("current_medications", {}).get("content", "") if isinstance(latest_visit.get("current_medications"), dict) else latest_visit.get("current_medications", "")
-    details["allergies"] = latest_visit.get("allergies", {}).get("content", "") if isinstance(latest_visit.get("allergies"), dict) else latest_visit.get("allergies", "")
+    details["medical_history"] = [{"text": latest_visit.get("medical_history", {}).get("content", "") if isinstance(latest_visit.get("medical_history"), dict) else latest_visit.get("medical_history", "")}]
+    details["personal_history"] = [{"text": latest_visit.get("personal_history", {}).get("content", "") if isinstance(latest_visit.get("personal_history"), dict) else latest_visit.get("personal_history", "")}]
+    details["family_history"] = [{"text": latest_visit.get("family_history", {}).get("content", "") if isinstance(latest_visit.get("family_history"), dict) else latest_visit.get("family_history", "")}]
+    details["current_medications"] = [{"text": latest_visit.get("current_medications", {}).get("content", "") if isinstance(latest_visit.get("current_medications"), dict) else latest_visit.get("current_medications", "")}]
+    details["allergies"] = [{"text": latest_visit.get("allergies", {}).get("content", "") if isinstance(latest_visit.get("allergies"), dict) else latest_visit.get("allergies", "")}]
     
     logger.info(f"Extracted patient details from latest visit: {details}")
     return details
 
-# Modified process_llm_output for medications
 def process_llm_output(text, field):
     """Process LLM output into structured format"""
     if not text:
@@ -232,7 +287,6 @@ def process_llm_output(text, field):
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON for medications: {text}")
         
-        # Fallback parsing for medication format
         meds = []
         for part in text.split("},"):
             if "name" in part and "instructions" in part:
@@ -248,40 +302,38 @@ def process_llm_output(text, field):
                     logger.warning(f"Error in fallback parsing: {e}")
         return meds if meds else EXAMPLE_CASES["medications"][-1]["output"]
     
-    # Keep existing logic for other fields
     json_pattern = r'\[.*\]|\{.*\}'
     match = re.search(json_pattern, text, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group(0))
+            parsed = json.loads(match.group(0))
+            if field == "investigations" and isinstance(parsed, str):
+                return [{"text": parsed}]
+            if field == "diet_instructions" and isinstance(parsed, str):
+                return [{"text": parsed}]
+            return parsed
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse JSON for {field}: {text}")
     
     if field == "investigations":
         cleaned_text = ", ".join(line.strip().strip('"') for line in text.split(',') if line.strip())
-        return cleaned_text if cleaned_text and "test1" not in cleaned_text.lower() else EXAMPLE_CASES["investigations"][-1]["output"]
+        return [{"text": cleaned_text}] if cleaned_text and "test1" not in cleaned_text.lower() else [{"text": EXAMPLE_CASES["investigations"][-1]["output"]}]
     if field == "diet_instructions":
-        return text.strip().strip('"')
+        return [{"text": text.strip().strip('"')}]
     
     return None
 
-
-# Modified generate_prompt for medications
 def generate_prompt(field, patient_data, doctor_prefs):
     """Generate LLM prompt for a specific field"""
-    chief_complaints = patient_data.get("chief_complaints", {}).get("text", "")
-    if not chief_complaints or "suffering from" in chief_complaints.lower():
+    chief_complaints_list = patient_data.get("chief_complaints", [{"text": ""}])
+    chief_complaints = chief_complaints_list[0].get("text", "") if chief_complaints_list else ""
+
+    if not chief_complaints or not validate_chief_complaints(chief_complaints):
         return ""
 
     base_context = f"""
 Patient Information:
 - Chief complaints: {chief_complaints}
-- Medical history: {patient_data.get('medical_history', 'Not provided')}
-- Personal history (habits): {patient_data.get('personal_history', 'Not provided')}
-- Family history: {patient_data.get('family_history', 'Not provided')}
-- Current medications: {patient_data.get('current_medications', 'Not provided')}
-- Allergies: {patient_data.get('allergies', 'Not provided')}
-- Vitals: {patient_data.get('vitals', 'Not provided')}
 """
 
     if doctor_prefs:
@@ -293,7 +345,7 @@ Patient Information:
         if field == "medications" and doctor_prefs.get('medications'):
             medications = doctor_prefs['medications']
             if medications:
-                med_str = json.dumps(medications[:3])  # Limit to 3 most recent relevant meds
+                med_str = json.dumps(medications[:3])
                 base_context += f"- Previous medications for similar cases: {med_str}\n"
                 base_context += "Refine these medications based on the current condition if needed.\n"
         if doctor_prefs.get('diet_instructions'):
@@ -312,12 +364,11 @@ Patient Information:
     return prompts.get(field, "")
 
 def process_json_data(data):
-    """Process input JSON and return completed data"""
+    """Process input JSON and return completed data with text fields as arrays of objects"""
     result = data.copy()
     patient_id = result.get("patientId")
     doctor_id = result.get("doctorId")
     
-    # Validate request
     if not patient_id or not doctor_id:
         logger.error("Missing patientId or doctorId")
         return {"error": "Missing patientId or doctorId"}, 400
@@ -327,18 +378,18 @@ def process_json_data(data):
     patient_details = extract_patient_details(past_visits)
     result.update(patient_details)
 
-    # Step 2: Handle chief complaints
+    # Step 2: Handle chief complaints and validate
     chief_complaints = ""
     if "chief_complaints" in result:
         if isinstance(result["chief_complaints"], dict):
             chief_complaints = result["chief_complaints"].get("text", "")
         elif isinstance(result["chief_complaints"], str):
             chief_complaints = result["chief_complaints"]
-            # Convert to expected format for consistency
-            result["chief_complaints"] = {"text": chief_complaints}
+        result["chief_complaints"] = [{"text": chief_complaints}]
     
-    if not chief_complaints or "suffering from" in chief_complaints.lower():
-        logger.info("Invalid chief complaints, returning patient details only")
+    # Validate chief complaints
+    if not validate_chief_complaints(chief_complaints):
+        logger.info(f"Invalid chief complaints: '{chief_complaints}', returning patient details only")
         return result
 
     # Step 3: Fetch doctor preferences
@@ -358,8 +409,13 @@ def process_json_data(data):
                 if llm_output:
                     processed_output = process_llm_output(llm_output, field)
                     if processed_output is not None:
-                        result[field] = processed_output
-                        logger.info(f"Set {field} to: {processed_output}")
+                        if field == "investigations" and isinstance(processed_output, str):
+                            result[field] = [{"text": processed_output}]
+                        elif field == "diet_instructions" and isinstance(processed_output, str):
+                            result[field] = [{"text": processed_output}]
+                        else:
+                            result[field] = processed_output
+                        logger.info(f"Set {field} to: {result[field]}")
                 else:
                     logger.warning(f"No LLM output received for {field}")
 
