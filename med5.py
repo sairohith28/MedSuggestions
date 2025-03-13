@@ -33,7 +33,7 @@ investigations_collection = db["investigations"]
 LLM_API_URL = os.getenv("LLM_API_URL")
 LLM_AUTH_HEADER = os.getenv("LLM_AUTH_HEADER")
 
-# Semantic model
+# Semantic model (used only for patient/doctor records)
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Example cases for few-shot learning
@@ -148,40 +148,36 @@ def get_icd11_diagnosis(diagnosis_name):
         return None
 
 def search_collection(collection, search_term, field="name"):
-    """Search a collection using semantic similarity and return code and name"""
+    """Search a collection using regex for keyword matching (case-insensitive)"""
     try:
-        items = list(collection.find())
-        if not items:
-            return {"code": "", "name": search_term}
-        
-        search_embedding = semantic_model.encode(search_term.lower(), convert_to_tensor=True)
-        best_match = None
-        highest_similarity = 0.7
-        
-        for item in items:
-            name = item.get(field, "").lower()
-            generic_name = item.get("generic_name", "").lower() if "generic_name" in item else ""
-            
-            for text in [name, generic_name]:
-                if not text:
-                    continue
-                item_embedding = semantic_model.encode(text, convert_to_tensor=True)
-                similarity = util.cos_sim(search_embedding, item_embedding).item()
-                
-                if similarity > highest_similarity:
-                    highest_similarity = similarity
-                    best_match = {"code": str(item["_id"]), "name": item["name"]}
-        
-        return best_match if best_match else {"code": "", "name": search_term}
+        if not search_term or not isinstance(search_term, str):
+            return {"code": "", "name": search_term or ""}
+
+        # Case-insensitive regex search
+        regex_pattern = re.compile(re.escape(search_term), re.IGNORECASE)
+        query = {
+            "$or": [
+                {field: {"$regex": regex_pattern}},
+                {"generic_name": {"$regex": regex_pattern}} if collection.name == "medications" else {}
+            ]
+        }
+        # Remove empty conditions
+        if not query["$or"][-1]:
+            query["$or"].pop()
+
+        result = collection.find_one(query)
+        if result:
+            return {"code": str(result["_id"]), "name": result["name"]}
+        return {"code": "", "name": search_term}
     except Exception as e:
         logger.error(f"Error searching collection {collection.name}: {str(e)}")
         return {"code": "", "name": search_term}
 
 def fetch_patient_history(patient_id):
-    """Fetch last 10 consultations for patient"""
+    """Fetch last 10 consultations for patient using semantic similarity"""
     try:
-        visits = patient_visits_collection.find({"patientId": ObjectId(patient_id)}).sort("createdAt", -1).limit(10)
-        return list(visits)
+        visits = list(patient_visits_collection.find({"patientId": ObjectId(patient_id)}).sort("createdAt", -1).limit(10))
+        return visits
     except Exception as e:
         logger.error(f"Error fetching patient history: {str(e)}")
         return []
@@ -313,7 +309,7 @@ def process_llm_output(text, field):
     return None
 
 def refine_special_fields(data):
-    """Refine allergies, medications, and investigations by searching collections"""
+    """Refine allergies, medications, and investigations by searching collections with keywords"""
     if "allergies" in data and data["allergies"]:
         refined_allergies = []
         for allergy in data["allergies"]:
@@ -438,7 +434,7 @@ def process_json_data(data):
             if api_diagnosis:
                 result["diagnosis"] = [api_diagnosis]
 
-    # Step 6: Refine allergies, medications, and investigations
+    # Step 6: Refine allergies, medications, and investigations with keyword search
     result = refine_special_fields(result)
 
     return result
