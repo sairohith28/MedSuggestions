@@ -87,7 +87,7 @@ This project is licensed under the MIT License. See the [LICENSE](http://_vscode
 
 ## Contact
 
-For any questions or suggestions, feel free to open an issue or contact the project maintainer at [your-email@example.com](mailto:your-email@example.com).
+For any questions or suggestions, feel free to open an issue or contact the project maintainer at [vulapusairohith28@gmail.com](mailto:vulapusairohith28@gmail.com).
 
 ---
 
