@@ -44,6 +44,12 @@ EXAMPLE_CASES = {
         {"input": "Chief complaints: rash and itching", "output": [{"code": "L50.9", "name": "Urticaria, unspecified"}]},
         {"input": "Chief complaints: Ae JCB hit the patient on ribs area...", "output": [{"code": "S29.9", "name": "Unspecified injury of thorax"}]},
     ],
+    "allergies": [
+        {"input": "Chief complaints: rash and itching all over body after eating shellfish", "output": [{"code": "", "name": "Shellfish allergy"}]},
+        {"input": "Chief complaints: sneezing, runny nose, and watery eyes during spring", "output": [{"code": "", "name": "Pollen allergy"}]},
+        {"input": "Chief complaints: hives after taking penicillin", "output": [{"code": "", "name": "Penicillin allergy"}]},
+        {"input": "Chief complaints: swelling and difficulty breathing after bee sting", "output": [{"code": "", "name": "Bee venom allergy"}]},
+    ],
     "investigations": [
         {"input": "Chief complaints: High blood pressure and chest pain.", "output": [{"code": "", "name": "ECG"}, {"code": "", "name": "Chest X-ray"}]},
         {"input": "Chief complaints: cold and ingestion", "output": [{"code": "", "name": "CBC"}, {"code": "", "name": "Chest X-ray"}]},
@@ -191,7 +197,7 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
         visits = patient_visits_collection.find({"doctorId": ObjectId(doctor_id)}).sort("createdAt", -1).limit(50)
         doctor_visits = list(visits)
         
-        preferences = {"diagnosis": [], "investigations": [], "medications": [], "diet_instructions": [], "followup": []}
+        preferences = {"diagnosis": [], "investigations": [], "medications": [], "diet_instructions": [], "followup": [], "allergies": []}
         current_embedding = semantic_model.encode(chief_complaints.lower(), convert_to_tensor=True)
         
         for visit in doctor_visits:
@@ -216,6 +222,9 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
                     preferences["diet_instructions"].append(content)
                 if "followup" in visit and visit["followup"]:
                     preferences["followup"].append(visit["followup"])
+                if "allergies" in visit and visit["allergies"]:
+                    allergies = [item["name"] for item in visit["allergies"]] if isinstance(visit["allergies"], list) else visit["allergies"]
+                    preferences["allergies"].extend(allergies)
         
         return preferences
     except Exception as e:
@@ -255,13 +264,15 @@ def process_llm_output(text, field):
         logger.warning(f"No text received for field {field}")
         if field == "medications":
             return [{"code": "", "name": "Paracetamol"}]
+        if field == "allergies":
+            return [{"code": "", "name": "None"}]
         return None
     
     text = re.sub(r'^(INSTRUCTIONS|Output:)\s*', '', text.strip(), flags=re.IGNORECASE)
     text = text.strip('"')
     text = re.sub(r'\n+', '', text).strip()
     
-    if field == "medications":
+    if field in ["medications", "allergies"]:
         json_pattern = r'\[.*\]'
         match = re.search(json_pattern, text, re.DOTALL)
         if match:
@@ -269,14 +280,19 @@ def process_llm_output(text, field):
                 parsed = json.loads(match.group(0))
                 return [{"code": "", "name": item["name"]} for item in parsed if isinstance(item, dict) and "name" in item]
             except json.JSONDecodeError:
-                logger.warning(f"Failed to parse JSON for medications: {text}")
+                logger.warning(f"Failed to parse JSON for {field}: {text}")
         
-        meds = []
+        items = []
         for part in text.split("},"):
             name_match = re.search(r'"name":\s*"([^"]+)"', part)
             if name_match:
-                meds.append({"code": "", "name": name_match.group(1)})
-        return meds if meds else [{"code": "", "name": "Paracetamol"}]
+                items.append({"code": "", "name": name_match.group(1)})
+        
+        if field == "medications" and not items:
+            return [{"code": "", "name": "Paracetamol"}]
+        if field == "allergies" and not items:
+            return [{"code": "", "name": "None"}]
+        return items
     
     if field == "investigations":
         json_pattern = r'\[.*\]'
@@ -360,6 +376,8 @@ Patient Information:
             base_context += f"- Previous investigations: {', '.join(doctor_prefs['investigations'][:5])}\n"
         if field == "medications" and doctor_prefs.get('medications'):
             base_context += f"- Previous medications: {', '.join(doctor_prefs['medications'][:3])}\n"
+        if field == "allergies" and doctor_prefs.get('allergies'):
+            base_context += f"- Previous identified allergies: {', '.join(doctor_prefs['allergies'][:3])}\n"
         if doctor_prefs.get('diet_instructions'):
             base_context += f"- Previous diet instructions: {doctor_prefs['diet_instructions'][0][:50]}...\n"
         if doctor_prefs.get('followup'):
@@ -369,6 +387,7 @@ Patient Information:
         "diagnosis": f"{base_context}\nProvide the most likely diagnosis based on current complaints and history.\nOutput format: [{{\"code\": \"ICD_CODE\", \"name\": \"DIAGNOSIS_NAME\"}}]\n{format_examples('diagnosis')}",
         "investigations": f"{base_context}\nProvide a concise, relevant list of investigations for the current condition.\nOutput format: [{{\"code\": \"\", \"name\": \"TEST_NAME\"}}]\n{format_examples('investigations')}",
         "medications": f"{base_context}\nProvide a list of medications based on the patient's current complaints and history.\nOutput format: [{{\"code\": \"\", \"name\": \"MED_NAME\"}}]\n{format_examples('medications')}",
+        "allergies": f"{base_context}\nBased on the chief complaints, suggest possible allergies that may be related to the current condition.\nOutput format: [{{\"code\": \"\", \"name\": \"ALLERGY_NAME\"}}]\n{format_examples('allergies')}",
         "followup": f"{base_context}\nProvide a followup plan based on current condition.\nOutput format: {{\"date\": \"YYYY-MM-DD\", \"text\": \"INSTRUCTIONS\"}}\n{format_examples('followup')}",
         "diet_instructions": f"{base_context}\nProvide concise diet instructions relevant to current condition as a single line.\nOutput format: \"INSTRUCTIONS\"\n{format_examples('diet_instructions')}"
     }
@@ -383,7 +402,7 @@ def process_json_data(data):
     
     if not patient_id or not doctor_id:
         logger.error("Missing patientId or doctorId")
-        return {"error": "Missing patientId or doctorId"}, 400
+        return {"status": False, "message": "Missing patientId or doctorId"}, 400
 
     # Step 1: Fetch patient history and fill patient sections
     past_visits = fetch_patient_history(patient_id)
@@ -401,13 +420,13 @@ def process_json_data(data):
     
     if not validate_chief_complaints(chief_complaints):
         logger.info(f"Invalid chief complaints: '{chief_complaints}'")
-        return result
+        return {"status": True, "data": result, "message": "Processed with default values due to invalid chief complaints"}
 
     # Step 3: Fetch doctor preferences
     doctor_prefs = fetch_doctor_preferences(doctor_id, chief_complaints)
 
     # Step 4: Process fields with LLM
-    doctor_fields = ["diagnosis", "investigations", "medications", "followup", "diet_instructions"]
+    doctor_fields = ["diagnosis", "investigations", "medications", "allergies", "followup", "diet_instructions"]
     for field in doctor_fields:
         is_empty = (field not in result or 
                     (isinstance(result[field], list) and not result[field]) or 
@@ -437,7 +456,7 @@ def process_json_data(data):
     # Step 6: Refine allergies, medications, and investigations with keyword search
     result = refine_special_fields(result)
 
-    return result
+    return {"status": True, "data": result, "message": "Successfully processed patient data"}
 
 @app.route('/api/suggest', methods=['POST'])
 def suggest():
@@ -445,7 +464,7 @@ def suggest():
     try:
         data = request.json
         if not data or "patientId" not in data or "doctorId" not in data:
-            return jsonify({"error": "Missing patientId or doctorId"}), 400
+            return jsonify({"status": False, "data": {}, "message": "Missing patientId or doctorId"}), 400
         
         completed_data = process_json_data(data)
         if isinstance(completed_data, tuple):
@@ -453,7 +472,7 @@ def suggest():
         return jsonify(completed_data)
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"status": False, "data": {}, "message": f"Error: {str(e)}"}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
