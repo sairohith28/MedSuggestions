@@ -162,25 +162,42 @@ def search_collection(collection, search_term, field="name", use_embeddings=Fals
         if not search_term or not isinstance(search_term, str):
             return {"code": "", "name": search_term or ""}
 
+        # Use vector search for medications collection
         if use_embeddings and collection.name == "medications":
-            query_embedding = semantic_model.encode(search_term.lower(), convert_to_tensor=True).cpu()  # Move to CPU
-            all_meds = list(collection.find({}))
-            similarities = []
+            # Encode the search term to get the embedding vector
+            query_embedding = semantic_model.encode(search_term.lower(), convert_to_tensor=True).cpu().numpy().tolist()
             
-            for med in all_meds:
-                if "name_generic_embedding" in med:
-                    db_embedding = torch.tensor(med["name_generic_embedding"], device='cpu')  # Ensure on CPU
-                    similarity = util.cos_sim(query_embedding, db_embedding).item()
-                    similarities.append((similarity, med))
+            # Use MongoDB Atlas Vector Search
+            pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": "default",
+                        "path": "name_generic_embedding",
+                        "queryVector": query_embedding,
+                        "numCandidates": 100,  # Consider more candidates for better results
+                        "limit": 5  # Return top 5 matches
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 1,
+                        "name": 1,
+                        "score": {"$meta": "vectorSearchScore"}
+                    }
+                }
+            ]
             
-            if similarities:
-                similarities.sort(reverse=True, key=lambda x: x[0])  # Sort by similarity score only
-                top_match = similarities[0]
-                if top_match[0] >= 0.8:  # 80% similarity threshold
-                    return {"code": str(top_match[1]["_id"]), "name": top_match[1]["name"]}
+            results = list(collection.aggregate(pipeline))
+            
+            if results:
+                # Get the top match with highest similarity score
+                top_match = results[0]
+                if top_match.get("score") >= 0.7:  # 70% similarity threshold
+                    return {"code": str(top_match["_id"]), "name": top_match["name"]}
             
             return {"code": "", "name": search_term}  # Return without ID if no match
             
+        # Fallback to regex search for other collections or when vector search is not specified
         regex_pattern = re.compile(re.escape(search_term), re.IGNORECASE)
         query = {
             "$or": [
@@ -200,26 +217,59 @@ def search_collection(collection, search_term, field="name", use_embeddings=Fals
         return {"code": "", "name": search_term}
 
 def check_drug_interactions(medications):
-    """Check for drug-to-drug interactions with specific levels"""
+    """Check for drug-to-drug interactions using vector search"""
     valid_levels = {"Minor", "Moderate", "Major"}
     interactions = []
+    
+    # Skip if there's only one medication (no interactions possible)
+    if len(medications) <= 1:
+        return interactions
+    
     med_names = [med["name"].lower() for med in medications if med.get("name")]
-
+    
+    # For each medication pair, check for interactions
     for i, med_a in enumerate(med_names):
         for j, med_b in enumerate(med_names[i+1:], start=i+1):
-            interaction = drug_interactions_collection.find_one({
-                "$or": [
-                    {"Drug_A": {"$regex": f"^{med_a}$", "$options": "i"}, "Drug_B": {"$regex": f"^{med_b}$", "$options": "i"}},
-                    {"Drug_A": {"$regex": f"^{med_b}$", "$options": "i"}, "Drug_B": {"$regex": f"^{med_a}$", "$options": "i"}}
-                ]
-            })
-            if interaction and interaction["Level"] in valid_levels:
-                interactions.append({
-                    "drug_a": med_a,
-                    "drug_b": med_b,
-                    "level": interaction["Level"],
-                    "suggestion": f"{med_a}-{med_b} combination has a {interaction['Level']} interaction"
-                })
+            # Create a combined string to search for the interaction
+            interaction_query = f"{med_a} {med_b}"
+            
+            # Encode the query for vector search
+            query_embedding = semantic_model.encode(interaction_query, convert_to_tensor=True).cpu().numpy().tolist()
+            
+            # Use MongoDB Atlas Vector Search
+            pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": "default",
+                        "path": "interaction_embedding",
+                        "queryVector": query_embedding,
+                        "numCandidates": 50,
+                        "limit": 3
+                    }
+                },
+                {
+                    "$project": {
+                        "Drug_A": 1,
+                        "Drug_B": 1,
+                        "Level": 1,
+                        "score": {"$meta": "vectorSearchScore"}
+                    }
+                }
+            ]
+            
+            results = list(drug_interactions_collection.aggregate(pipeline))
+            
+            # Filter for valid interaction levels and minimum similarity score
+            for result in results:
+                if result.get("score") >= 0.75 and result.get("Level") in valid_levels:
+                    interactions.append({
+                        "drug_a": med_a,
+                        "drug_b": med_b,
+                        "level": result["Level"],
+                        "suggestion": f"{med_a}-{med_b} combination has a {result['Level']} interaction"
+                    })
+                    # Only add the top interaction for this pair
+                    break
     
     return interactions
 
