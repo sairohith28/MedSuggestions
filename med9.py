@@ -71,12 +71,6 @@ EXAMPLE_CASES = {
         {"input": "Chief complaints: High blood pressure and chest pain.", "output": "Reduce salt intake, avoid fatty foods, increase potassium-rich foods"},
         {"input": "Chief complaints: cold and ingestion", "output": "Stay hydrated, drink plenty of fluids, avoid spicy foods"},
         {"input": "Chief complaints: Ae JCB hit the patient on ribs area...", "output": "Eat soft foods, avoid heavy lifting, maintain light diet"}
-    ],
-    "allergies": [
-        {"input": "Chief complaints: rash and itching", "output": [{"code": "", "name": "Pollen"}]},
-        {"input": "Chief complaints: wheezing and shortness of breath", "output": [{"code": "", "name": "Dust mites"}]},
-        {"input": "Chief complaints: swelling after eating peanuts", "output": [{"code": "", "name": "Peanuts"}]},
-        {"input": "Chief complaints: severe pain in the lungs and chills and fever with headache", "output": [{"code": "", "name": "Dust mites"}]}
     ]
 }
 
@@ -183,12 +177,13 @@ def search_collection(collection, search_term, field="name", use_embeddings=Fals
                 }
             ]
             results = list(collection.aggregate(pipeline))
+            # print("Medication Results:", results)
             if results:
                 top_match = results[0]
                 if top_match.get("score") >= 0.7:
                     return {"code": str(top_match["_id"]), "name": top_match["name"]}
             return {"code": "", "name": search_term}
-        
+            
         regex_pattern = re.compile(re.escape(search_term), re.IGNORECASE)
         query = {
             "$or": [
@@ -208,17 +203,21 @@ def search_collection(collection, search_term, field="name", use_embeddings=Fals
         return {"code": "", "name": search_term}
 
 def check_drug_interactions(medications):
-    """Check for drug-to-drug interactions using vector search"""
+    """Check for drug-to-drug interactions using vector search, then filter for exact matches"""
     valid_levels = {"Minor", "Moderate", "Major"}
     interactions = []
+    
     if len(medications) <= 1:
         return interactions
     
     med_names = [med["name"].lower() for med in medications if med.get("name")]
+    med_names_set = set(med_names)
+    
     for i, med_a in enumerate(med_names):
         for j, med_b in enumerate(med_names[i+1:], start=i+1):
             interaction_query = f"{med_a} {med_b}"
             query_embedding = semantic_model.encode(interaction_query, convert_to_tensor=True).cpu().numpy().tolist()
+            
             pipeline = [
                 {
                     "$vectorSearch": {
@@ -238,16 +237,23 @@ def check_drug_interactions(medications):
                     }
                 }
             ]
+            
             results = list(drug_interactions_collection.aggregate(pipeline))
+            
             for result in results:
-                if result.get("score") >= 0.75 and result.get("Level") in valid_levels:
-                    interactions.append({
-                        "drug_a": med_a,
-                        "drug_b": med_b,
-                        "level": result["Level"],
-                        "suggestion": f"{med_a}-{med_b} combination has a {result['Level']} interaction"
-                    })
-                    break
+                if result.get("score") >= 0.75:  # Removed Level check
+                    drug_a = result["Drug_A"].lower()
+                    drug_b = result["Drug_B"].lower()
+                    if drug_a in med_names_set and drug_b in med_names_set:
+                        level = result.get("Level", "Unknown")  # Use Unknown if Level is missing
+                        interactions.append({
+                            "drug_a": med_a,
+                            "drug_b": med_b,
+                            "level": level,
+                            "suggestion": f"{med_a}-{med_b} combination has a {level} interaction"
+                        })
+                        break
+    
     return interactions
 
 def fetch_patient_history(patient_id):
@@ -268,7 +274,7 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
         visits = patient_visits_collection.find({"doctorId": ObjectId(doctor_id)}).sort("createdAt", -1).limit(50)
         doctor_visits = list(visits)
         
-        preferences = {"diagnosis": [], "investigations": [], "medications": [], "diet_instructions": [], "followup": [], "allergies": []}
+        preferences = {"diagnosis": [], "investigations": [], "medications": [], "diet_instructions": [], "followup": []}
         current_embedding = semantic_model.encode(chief_complaints.lower(), convert_to_tensor=True)
         
         for visit in doctor_visits:
@@ -293,9 +299,6 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
                     preferences["diet_instructions"].append(content)
                 if "followup" in visit and visit["followup"]:
                     preferences["followup"].append(visit["followup"])
-                if "allergies" in visit and visit["allergies"]:
-                    allergies = [item["name"] for item in visit["allergies"]] if isinstance(visit["allergies"], list) else visit["allergies"]
-                    preferences["allergies"].extend(allergies)
         
         return preferences
     except Exception as e:
@@ -312,13 +315,6 @@ def extract_patient_details(past_visits, input_data=None):
         "allergies": [{"code": "", "name": ""}]
     }
     
-    if input_data and "allergies" in input_data:
-        input_allergies = input_data["allergies"]
-        if isinstance(input_allergies, str) and input_allergies.strip():
-            details["allergies"] = [{"code": "", "name": input_allergies}]
-        elif isinstance(input_allergies, list) and input_allergies:
-            details["allergies"] = input_allergies
-
     if not past_visits:
         return details
 
@@ -328,12 +324,11 @@ def extract_patient_details(past_visits, input_data=None):
     details["family_history"] = [{"text": latest_visit.get("family_history", {}).get("content", "") if isinstance(latest_visit.get("family_history"), dict) else latest_visit.get("family_history", "")}]
     details["current_medications"] = [{"text": latest_visit.get("current_medications", {}).get("content", "") if isinstance(latest_visit.get("current_medications"), dict) else latest_visit.get("current_medications", "")}]
     
-    if input_data and "allergies" not in input_data or not input_data["allergies"]:
-        allergies = latest_visit.get("allergies", [])
-        if isinstance(allergies, list) and allergies:
-            details["allergies"] = [{"code": str(item.get("code", "")), "name": item.get("name", "")} for item in allergies]
-        elif isinstance(allergies, str) and allergies:
-            details["allergies"] = [{"code": "", "name": allergies}]
+    allergies = latest_visit.get("allergies", [])
+    if isinstance(allergies, list) and allergies:
+        details["allergies"] = [{"code": str(item.get("code", "")), "name": item.get("name", "")} for item in allergies]
+    elif isinstance(allergies, str) and allergies:
+        details["allergies"] = [{"code": "", "name": allergies}]
     
     return details
 
@@ -343,15 +338,12 @@ def process_llm_output(text, field):
         logger.warning(f"No text received for field {field}")
         if field == "medications":
             return [{"code": "", "name": "Paracetamol"}]
-        if field == "allergies":
-            return [{"code": "", "name": "None identified"}]
         return None
     
     text = re.sub(r'^(INSTRUCTIONS|Output:)\s*', '', text.strip(), flags=re.IGNORECASE)
-    text = text.strip('"')
-    text = re.sub(r'\n+', '', text).strip()
+    text = text.strip('"').lstrip(':').strip()  # Ensure colon is removed at the start
     
-    if field in ["medications", "allergies"]:
+    if field in ["medications"]:
         json_pattern = r'\[.*\]'
         match = re.search(json_pattern, text, re.DOTALL)
         if match:
@@ -371,7 +363,7 @@ def process_llm_output(text, field):
                 items.append({"code": "", "name": name_match.group(1)})
         seen = set()
         items = [item for item in items if not (item["name"] in seen or seen.add(item["name"]))]
-        return items if items else [{"code": "", "name": "Paracetamol" if field == "medications" else "None identified"}]
+        return items if items else [{"code": "", "name": "Paracetamol" if field == "medications" else ""}]
     
     if field == "investigations":
         json_pattern = r'\[.*\]'
@@ -393,7 +385,7 @@ def process_llm_output(text, field):
         try:
             parsed = json.loads(match.group(0))
             if field == "diet_instructions" and isinstance(parsed, str):
-                return [{"text": parsed.lstrip(':').strip()}]
+                return [{"text": parsed.lstrip(':').strip()}]  # Ensure colon is removed
             if field == "followup" and isinstance(parsed, dict):
                 current_date = datetime(2025, 3, 20)
                 followup_date = datetime.strptime(parsed["date"], "%Y-%m-%d")
@@ -406,21 +398,12 @@ def process_llm_output(text, field):
             logger.warning(f"Failed to parse JSON for {field}: {text}")
     
     if field == "diet_instructions":
-        return [{"text": text.strip().lstrip(':')}] 
+        return [{"text": text.lstrip(':').strip()}]  # Ensure colon is removed here too
     
     return None
 
 def refine_special_fields(data):
-    """Refine allergies, medications, and investigations with embeddings for medications"""
-    if "allergies" in data and data["allergies"]:
-        refined_allergies = []
-        for allergy in data["allergies"]:
-            name = allergy.get("name", "")
-            if name:
-                refined = search_collection(allergies_collection, name)
-                refined_allergies.append(refined)
-        data["allergies"] = refined_allergies
-    
+    """Refine medications and investigations with embeddings for medications"""
     if "medications" in data and data["medications"]:
         refined_meds = []
         for med in data["medications"]:
@@ -428,7 +411,16 @@ def refine_special_fields(data):
             if name:
                 refined = search_collection(medications_collection, name, use_embeddings=True)
                 refined_meds.append(refined)
-        data["medications"] = refined_meds
+        
+        # Deduplicate medications based on name
+        seen_names = set()
+        unique_meds = []
+        for med in refined_meds:
+            if med["name"].lower() not in seen_names:
+                seen_names.add(med["name"].lower())
+                unique_meds.append(med)
+        data["medications"] = unique_meds
+        
         interactions = check_drug_interactions(data["medications"])
         if interactions:
             data["drug_interactions"] = interactions
@@ -465,8 +457,6 @@ Patient Information:
             base_context += f"- Previous investigations: {', '.join(doctor_prefs['investigations'][:5])}\n"
         if field == "medications" and doctor_prefs.get('medications'):
             base_context += f"- Previous medications: {', '.join(doctor_prefs['medications'][:3])}\n"
-        if field == "allergies" and doctor_prefs.get('allergies'):
-            base_context += f"- Previous allergies: {', '.join(doctor_prefs['allergies'][:3])}\n"
         if doctor_prefs.get('diet_instructions'):
             base_context += f"- Previous diet instructions: {doctor_prefs['diet_instructions'][0][:50]}...\n"
         if doctor_prefs.get('followup'):
@@ -477,73 +467,13 @@ Patient Information:
         "investigations": f"{base_context}\nProvide a concise, relevant list of investigations for the current condition.\nOutput format: [{{\"code\": \"\", \"name\": \"TEST_NAME\"}}]\n{format_examples('investigations')}",
         "medications": f"{base_context}\nProvide a list of unique medications (no duplicates) based on the patient's current complaints and history.\nOutput format: [{{\"code\": \"\", \"name\": \"MED_NAME\"}}]\n{format_examples('medications')}",
         "followup": f"{base_context}\nProvide a followup plan based on current condition with a date after March 20, 2025.\nOutput format: {{\"date\": \"YYYY-MM-DD\", \"text\": \"INSTRUCTIONS\"}}\n{format_examples('followup')}",
-        "diet_instructions": f"{base_context}\nProvide concise diet instructions relevant to current condition as a single line.\nOutput format: \"INSTRUCTIONS\"\n{format_examples('diet_instructions')}",
-        "allergies": f"{base_context}\nProvide a list of unique potential allergens (no duplicates, e.g., pollen, peanuts, dust mites, not diseases) based on the patient's current complaints.\nOutput format: [{{\"code\": \"\", \"name\": \"ALLERGY_NAME\"}}]\n{format_examples('allergies')}"
+        "diet_instructions": f"{base_context}\nProvide concise diet instructions relevant to current condition as a single line.\nOutput format: \"INSTRUCTIONS\"\n{format_examples('diet_instructions')}"
     }
     
     return prompts.get(field, "")
 
-def generate_field_suggestions(data):
-    """Generate second-layer suggestions or warnings for each field"""
-    suggestions = {}
-    chief_complaints = data.get("chief_complaints", [{"text": ""}])[0].get("text", "")
-
-    # Diagnosis
-    if "diagnosis" in data and data["diagnosis"]:
-        if not data["diagnosis"] or (isinstance(data["diagnosis"], list) and not any(d.get("name") for d in data["diagnosis"])):
-            suggestions["diagnosis"] = "Diagnosis is empty; it should reflect the chief complaints like lung pain and fever."
-    else:
-        suggestions["diagnosis"] = "No diagnosis provided; consider a respiratory infection based on symptoms."
-
-    # Medications
-    if "medications" in data and data["medications"]:
-        med_names = [m["name"].lower() for m in data["medications"]]
-        if "anistreplase" in med_names:
-            suggestions["medications"] = "Anistreplase is a thrombolytic and not typically indicated for lung pain or fever; consider antibiotics or antipyretics instead."
-        if len(med_names) > 3:
-            suggestions["medications"] = "Multiple NSAIDs (Diclofenac, Indomethacin) are listed; this increases the risk of gastrointestinal side effects."
-        if "drug_interactions" in data and data["drug_interactions"]:
-            suggestions["medications"] = "Drug interactions detected; review combinations for safety."
-
-    # Investigations
-    if "investigations" in data and data["investigations"]:
-        inv_names = [i["name"].lower() for i in data["investigations"]]
-        if "knee x-ray" in inv_names and "lung" in chief_complaints.lower():
-            suggestions["investigations"] = "Knee X-Ray seems unrelated to lung pain; consider a chest CT or sputum culture instead."
-        if "chest x-ray" not in inv_names and "blood culture" not in inv_names:
-            suggestions["investigations"] = "Chest X-Ray and Blood Culture are present, but ensure they align with suspected infection."
-
-    # Allergies
-    if "allergies" in data and (not data["allergies"] or data["allergies"] == [{"code": "", "name": ""}]):
-        suggestions["allergies"] = "No allergies specified; consider checking for common triggers like dust mites given the respiratory symptoms."
-
-    # Diet Instructions
-    if "diet_instructions" in data and data["diet_instructions"]:
-        diet_text = data["diet_instructions"][0].get("text", "").lower()
-        if "increase salt intake" in diet_text and "fever" in chief_complaints.lower():
-            suggestions["diet_instructions"] = "Increasing salt intake and fatty foods may not be suitable for fever; hydration should be prioritized."
-
-    # Vitals
-    if "vitals" in data and data["vitals"]:
-        vitals = data["vitals"][0]
-        bp_systolic = vitals.get("bp", {}).get("systolic", "")
-        bp_diastolic = vitals.get("bp", {}).get("diastolic", "")
-        if bp_systolic and bp_diastolic:
-            try:
-                sys, dia = int(bp_systolic), int(bp_diastolic)
-                if sys < dia or dia > 200 or sys < 60:
-                    suggestions["vitals"] = "Blood pressure values (systolic 60, diastolic 1000) are likely erroneous; please verify the readings."
-            except ValueError:
-                suggestions["vitals"] = "Blood pressure values are invalid; ensure they are numeric and realistic."
-
-    # Followup
-    if "followup" in data and data["followup"].get("date") == "":
-        suggestions["followup"] = "Followup date is missing; recommend scheduling within 5-7 days for acute symptoms like fever and lung pain."
-
-    return suggestions
-
 def process_json_data(data):
-    """Process input JSON and return completed data with suggestions"""
+    """Process input JSON and return completed data"""
     result = data.copy()
     patient_id = result.get("patientId")
     doctor_id = result.get("doctorId")
@@ -553,7 +483,7 @@ def process_json_data(data):
         return {"error": "Missing patientId or doctorId"}, 400
 
     past_visits = fetch_patient_history(patient_id)
-    patient_details = extract_patient_details(past_visits, result)
+    patient_details = extract_patient_details(past_visits)
     result.update(patient_details)
 
     chief_complaints = ""
@@ -570,13 +500,13 @@ def process_json_data(data):
 
     doctor_prefs = fetch_doctor_preferences(doctor_id, chief_complaints)
 
-    doctor_fields = ["diagnosis", "investigations", "medications", "followup", "diet_instructions", "allergies"]
+    doctor_fields = ["diagnosis", "investigations", "medications", "followup", "diet_instructions"]
     for field in doctor_fields:
         is_empty = (field not in result or 
                     (isinstance(result[field], list) and not result[field]) or 
                     (isinstance(result[field], str) and not result[field].strip()) or 
                     (isinstance(result[field], dict) and not any(result[field].values())))
-        if is_empty or (field == "allergies" and result[field] == [{"code": "", "name": ""}]):
+        if is_empty:
             prompt = generate_prompt(field, result, doctor_prefs)
             if prompt:
                 llm_output = get_llm_suggestion(prompt)
@@ -597,10 +527,6 @@ def process_json_data(data):
                 result["diagnosis"] = [api_diagnosis]
 
     result = refine_special_fields(result)
-
-    # Generate second-layer suggestions
-    suggestions = generate_field_suggestions(result)
-    result["suggestions"] = suggestions
 
     return result
 
