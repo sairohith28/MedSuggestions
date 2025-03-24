@@ -150,11 +150,22 @@ def get_icd11_diagnosis(diagnosis_name):
         logger.error(f"Error fetching ICD-11 diagnosis: {str(e)}")
         return None
 
-def search_collection(collection, search_term, field="name", use_embeddings=False):
-    """Search a collection using regex or embeddings"""
+def search_collection(collection, search_term, field="name", use_embeddings=False, branchId=None, organizationId=None):
+    """Search a collection using regex or embeddings with branchId and organizationId filters"""
     try:
         if not search_term or not isinstance(search_term, str):
             return {"code": "", "name": search_term or ""}
+
+        # Enforce branchId and organizationId for medications and investigations
+        if collection.name in ["medications", "investigations"]:
+            if not branchId or not organizationId:
+                logger.warning(f"Missing branchId or organizationId for {collection.name} search: {search_term}")
+                return {"code": "", "name": search_term}
+
+        query = {}
+        if collection.name in ["medications", "investigations"]:
+            query["branchId"] = branchId
+            query["organizationId"] = ObjectId(organizationId)
 
         if use_embeddings and collection.name == "medications":
             query_embedding = semantic_model.encode(search_term.lower(), convert_to_tensor=True).cpu().numpy().tolist()
@@ -169,6 +180,12 @@ def search_collection(collection, search_term, field="name", use_embeddings=Fals
                     }
                 },
                 {
+                    "$match": {
+                        "branchId": branchId,
+                        "organizationId": ObjectId(organizationId)
+                    }
+                },
+                {
                     "$project": {
                         "_id": 1,
                         "name": 1,
@@ -177,20 +194,17 @@ def search_collection(collection, search_term, field="name", use_embeddings=Fals
                 }
             ]
             results = list(collection.aggregate(pipeline))
-            # print("Medication Results:", results)
             if results:
                 top_match = results[0]
                 if top_match.get("score") >= 0.7:
                     return {"code": str(top_match["_id"]), "name": top_match["name"]}
             return {"code": "", "name": search_term}
-            
+
         regex_pattern = re.compile(re.escape(search_term), re.IGNORECASE)
-        query = {
-            "$or": [
-                {field: {"$regex": regex_pattern}},
-                {"generic_name": {"$regex": regex_pattern}} if collection.name == "medications" else {}
-            ]
-        }
+        query["$or"] = [
+            {field: {"$regex": regex_pattern}},
+            {"generic_name": {"$regex": regex_pattern}} if collection.name == "medications" else {}
+        ]
         if not query["$or"][-1]:
             query["$or"].pop()
 
@@ -404,12 +418,18 @@ def process_llm_output(text, field):
 
 def refine_special_fields(data):
     """Refine medications and investigations with embeddings for medications"""
+    branchId = data.get("branchId")
+    organizationId = data.get("organizationId")
+    
+    # Add logging to debug
+    logger.info(f"refine_special_fields - branchId: {branchId}, organizationId: {organizationId}")
+
     if "medications" in data and data["medications"]:
         refined_meds = []
         for med in data["medications"]:
             name = med.get("name", "")
             if name:
-                refined = search_collection(medications_collection, name, use_embeddings=True)
+                refined = search_collection(medications_collection, name, use_embeddings=True, branchId=branchId, organizationId=organizationId)
                 refined_meds.append(refined)
         
         # Deduplicate medications based on name
@@ -430,7 +450,7 @@ def refine_special_fields(data):
         for inv in data["investigations"]:
             name = inv.get("name", "")
             if name:
-                refined = search_collection(investigations_collection, name)
+                refined = search_collection(investigations_collection, name, branchId=branchId, organizationId=organizationId)
                 refined_invs.append(refined)
         data["investigations"] = refined_invs
     
@@ -477,6 +497,8 @@ def process_json_data(data):
     result = data.copy()
     patient_id = result.get("patientId")
     doctor_id = result.get("doctorId")
+    branchId = result.get("branchId")
+    organizationId = result.get("organizationId")
     
     if not patient_id or not doctor_id:
         logger.error("Missing patientId or doctorId")
@@ -525,6 +547,11 @@ def process_json_data(data):
             api_diagnosis = get_icd11_diagnosis(diagnosis_name)
             if api_diagnosis:
                 result["diagnosis"] = [api_diagnosis]
+
+    # Ensure branchId and organizationId are preserved
+    result["branchId"] = branchId
+    result["organizationId"] = organizationId
+    logger.info(f"process_json_data - Passing to refine_special_fields - branchId: {branchId}, organizationId: {organizationId}")
 
     result = refine_special_fields(result)
 
