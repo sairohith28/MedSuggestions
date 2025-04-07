@@ -1,4 +1,3 @@
-# Medical AI Assistant
 
 This project is a Medical AI Assistant designed to assist healthcare professionals by providing structured outputs for diagnoses, investigations, medications, follow-up plans, and diet instructions based on patient data and doctor preferences. The assistant leverages a combination of MongoDB for data storage, a semantic model for similarity matching, and a Language Learning Model (LLM) API for generating suggestions.
 
