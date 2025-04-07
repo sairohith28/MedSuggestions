@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from sentence_transformers import SentenceTransformer, util
 import certifi
 from bson import ObjectId
+import numpy as np
+import torch
 
 app = Flask(__name__)
 
@@ -27,13 +29,14 @@ db = client[DB_NAME]
 patient_visits_collection = db[COLLECTION_NAME]
 allergies_collection = db["masterallergies"]
 medications_collection = db["medications"]
+drug_interactions_collection = db["drug-interactions"]
 investigations_collection = db["investigations"]
 
 # LLM API endpoint and authorization
 LLM_API_URL = os.getenv("LLM_API_URL")
 LLM_AUTH_HEADER = os.getenv("LLM_AUTH_HEADER")
 
-# Semantic model (used only for patient/doctor records)
+# Semantic model
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Example cases for few-shot learning
@@ -60,14 +63,20 @@ EXAMPLE_CASES = {
         ]},
     ],
     "followup": [
-        {"input": "Chief complaints: High blood pressure and chest pain.", "output": {"date": "2025-03-12", "text": "Review in 1 week with ECG results."}},
-        {"input": "Chief complaints: cold and ingestion", "output": {"date": "2025-03-10", "text": "Review in 5 days."}},
-        {"input": "Chief complaints: Ae JCB hit the patient on ribs area...", "output": {"date": "2025-03-13", "text": "Review in 1 week with imaging results."}},
+        {"input": "Chief complaints: High blood pressure and chest pain.", "output": {"date": "2025-03-27", "text": "Review in 1 week with ECG results."}},
+        {"input": "Chief complaints: cold and ingestion", "output": {"date": "2025-03-25", "text": "Review in 5 days."}},
+        {"input": "Chief complaints: Ae JCB hit the patient on ribs area...", "output": {"date": "2025-03-27", "text": "Review in 1 week with imaging results."}},
     ],
     "diet_instructions": [
         {"input": "Chief complaints: High blood pressure and chest pain.", "output": "Reduce salt intake, avoid fatty foods, increase potassium-rich foods"},
         {"input": "Chief complaints: cold and ingestion", "output": "Stay hydrated, drink plenty of fluids, avoid spicy foods"},
         {"input": "Chief complaints: Ae JCB hit the patient on ribs area...", "output": "Eat soft foods, avoid heavy lifting, maintain light diet"}
+    ],
+    "allergies": [
+        {"input": "Chief complaints: rash and itching", "output": [{"code": "", "name": "Pollen"}]},
+        {"input": "Chief complaints: wheezing and shortness of breath", "output": [{"code": "", "name": "Dust mites"}]},
+        {"input": "Chief complaints: swelling after eating peanuts", "output": [{"code": "", "name": "Peanuts"}]},
+        {"input": "Chief complaints: severe pain in the lungs and chills and fever with headache", "output": [{"code": "", "name": "Dust mites"}]}
     ]
 }
 
@@ -147,13 +156,39 @@ def get_icd11_diagnosis(diagnosis_name):
         logger.error(f"Error fetching ICD-11 diagnosis: {str(e)}")
         return None
 
-def search_collection(collection, search_term, field="name"):
-    """Search a collection using regex for keyword matching (case-insensitive)"""
+def search_collection(collection, search_term, field="name", use_embeddings=False):
+    """Search a collection using regex or embeddings"""
     try:
         if not search_term or not isinstance(search_term, str):
             return {"code": "", "name": search_term or ""}
 
-        # Case-insensitive regex search
+        if use_embeddings and collection.name == "medications":
+            query_embedding = semantic_model.encode(search_term.lower(), convert_to_tensor=True).cpu().numpy().tolist()
+            pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": "default",
+                        "path": "name_generic_embedding",
+                        "queryVector": query_embedding,
+                        "numCandidates": 100,
+                        "limit": 5
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 1,
+                        "name": 1,
+                        "score": {"$meta": "vectorSearchScore"}
+                    }
+                }
+            ]
+            results = list(collection.aggregate(pipeline))
+            if results:
+                top_match = results[0]
+                if top_match.get("score") >= 0.7:
+                    return {"code": str(top_match["_id"]), "name": top_match["name"]}
+            return {"code": "", "name": search_term}
+        
         regex_pattern = re.compile(re.escape(search_term), re.IGNORECASE)
         query = {
             "$or": [
@@ -161,7 +196,6 @@ def search_collection(collection, search_term, field="name"):
                 {"generic_name": {"$regex": regex_pattern}} if collection.name == "medications" else {}
             ]
         }
-        # Remove empty conditions
         if not query["$or"][-1]:
             query["$or"].pop()
 
@@ -173,8 +207,51 @@ def search_collection(collection, search_term, field="name"):
         logger.error(f"Error searching collection {collection.name}: {str(e)}")
         return {"code": "", "name": search_term}
 
+def check_drug_interactions(medications):
+    """Check for drug-to-drug interactions using vector search"""
+    valid_levels = {"Minor", "Moderate", "Major"}
+    interactions = []
+    if len(medications) <= 1:
+        return interactions
+    
+    med_names = [med["name"].lower() for med in medications if med.get("name")]
+    for i, med_a in enumerate(med_names):
+        for j, med_b in enumerate(med_names[i+1:], start=i+1):
+            interaction_query = f"{med_a} {med_b}"
+            query_embedding = semantic_model.encode(interaction_query, convert_to_tensor=True).cpu().numpy().tolist()
+            pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": "default",
+                        "path": "interaction_embedding",
+                        "queryVector": query_embedding,
+                        "numCandidates": 50,
+                        "limit": 3
+                    }
+                },
+                {
+                    "$project": {
+                        "Drug_A": 1,
+                        "Drug_B": 1,
+                        "Level": 1,
+                        "score": {"$meta": "vectorSearchScore"}
+                    }
+                }
+            ]
+            results = list(drug_interactions_collection.aggregate(pipeline))
+            for result in results:
+                if result.get("score") >= 0.75 and result.get("Level") in valid_levels:
+                    interactions.append({
+                        "drug_a": med_a,
+                        "drug_b": med_b,
+                        "level": result["Level"],
+                        "suggestion": f"{med_a}-{med_b} combination has a {result['Level']} interaction"
+                    })
+                    break
+    return interactions
+
 def fetch_patient_history(patient_id):
-    """Fetch last 10 consultations for patient using semantic similarity"""
+    """Fetch last 10 consultations for patient"""
     try:
         visits = list(patient_visits_collection.find({"patientId": ObjectId(patient_id)}).sort("createdAt", -1).limit(10))
         return visits
@@ -191,7 +268,7 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
         visits = patient_visits_collection.find({"doctorId": ObjectId(doctor_id)}).sort("createdAt", -1).limit(50)
         doctor_visits = list(visits)
         
-        preferences = {"diagnosis": [], "investigations": [], "medications": [], "diet_instructions": [], "followup": []}
+        preferences = {"diagnosis": [], "investigations": [], "medications": [], "diet_instructions": [], "followup": [], "allergies": []}
         current_embedding = semantic_model.encode(chief_complaints.lower(), convert_to_tensor=True)
         
         for visit in doctor_visits:
@@ -216,13 +293,16 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
                     preferences["diet_instructions"].append(content)
                 if "followup" in visit and visit["followup"]:
                     preferences["followup"].append(visit["followup"])
+                if "allergies" in visit and visit["allergies"]:
+                    allergies = [item["name"] for item in visit["allergies"]] if isinstance(visit["allergies"], list) else visit["allergies"]
+                    preferences["allergies"].extend(allergies)
         
         return preferences
     except Exception as e:
         logger.error(f"Error fetching doctor preferences: {str(e)}")
         return {}
 
-def extract_patient_details(past_visits):
+def extract_patient_details(past_visits, input_data=None):
     """Extract patient sections from the last visit only"""
     details = {
         "medical_history": [{"text": ""}],
@@ -232,6 +312,13 @@ def extract_patient_details(past_visits):
         "allergies": [{"code": "", "name": ""}]
     }
     
+    if input_data and "allergies" in input_data:
+        input_allergies = input_data["allergies"]
+        if isinstance(input_allergies, str) and input_allergies.strip():
+            details["allergies"] = [{"code": "", "name": input_allergies}]
+        elif isinstance(input_allergies, list) and input_allergies:
+            details["allergies"] = input_allergies
+
     if not past_visits:
         return details
 
@@ -241,11 +328,12 @@ def extract_patient_details(past_visits):
     details["family_history"] = [{"text": latest_visit.get("family_history", {}).get("content", "") if isinstance(latest_visit.get("family_history"), dict) else latest_visit.get("family_history", "")}]
     details["current_medications"] = [{"text": latest_visit.get("current_medications", {}).get("content", "") if isinstance(latest_visit.get("current_medications"), dict) else latest_visit.get("current_medications", "")}]
     
-    allergies = latest_visit.get("allergies", [])
-    if isinstance(allergies, list) and allergies:
-        details["allergies"] = [{"code": str(item.get("code", "")), "name": item.get("name", "")} for item in allergies]
-    elif isinstance(allergies, str) and allergies:
-        details["allergies"] = [{"code": "", "name": allergies}]
+    if input_data and "allergies" not in input_data or not input_data["allergies"]:
+        allergies = latest_visit.get("allergies", [])
+        if isinstance(allergies, list) and allergies:
+            details["allergies"] = [{"code": str(item.get("code", "")), "name": item.get("name", "")} for item in allergies]
+        elif isinstance(allergies, str) and allergies:
+            details["allergies"] = [{"code": "", "name": allergies}]
     
     return details
 
@@ -255,28 +343,35 @@ def process_llm_output(text, field):
         logger.warning(f"No text received for field {field}")
         if field == "medications":
             return [{"code": "", "name": "Paracetamol"}]
+        if field == "allergies":
+            return [{"code": "", "name": "None identified"}]
         return None
     
     text = re.sub(r'^(INSTRUCTIONS|Output:)\s*', '', text.strip(), flags=re.IGNORECASE)
     text = text.strip('"')
     text = re.sub(r'\n+', '', text).strip()
     
-    if field == "medications":
+    if field in ["medications", "allergies"]:
         json_pattern = r'\[.*\]'
         match = re.search(json_pattern, text, re.DOTALL)
         if match:
             try:
                 parsed = json.loads(match.group(0))
-                return [{"code": "", "name": item["name"]} for item in parsed if isinstance(item, dict) and "name" in item]
+                items = [{"code": "", "name": item["name"]} for item in parsed if isinstance(item, dict) and "name" in item]
+                seen = set()
+                items = [item for item in items if not (item["name"] in seen or seen.add(item["name"]))]
+                return items
             except json.JSONDecodeError:
-                logger.warning(f"Failed to parse JSON for medications: {text}")
+                logger.warning(f"Failed to parse JSON for {field}: {text}")
         
-        meds = []
+        items = []
         for part in text.split("},"):
             name_match = re.search(r'"name":\s*"([^"]+)"', part)
             if name_match:
-                meds.append({"code": "", "name": name_match.group(1)})
-        return meds if meds else [{"code": "", "name": "Paracetamol"}]
+                items.append({"code": "", "name": name_match.group(1)})
+        seen = set()
+        items = [item for item in items if not (item["name"] in seen or seen.add(item["name"]))]
+        return items if items else [{"code": "", "name": "Paracetamol" if field == "medications" else "None identified"}]
     
     if field == "investigations":
         json_pattern = r'\[.*\]'
@@ -298,18 +393,25 @@ def process_llm_output(text, field):
         try:
             parsed = json.loads(match.group(0))
             if field == "diet_instructions" and isinstance(parsed, str):
-                return [{"text": parsed}]
+                return [{"text": parsed.lstrip(':').strip()}]
+            if field == "followup" and isinstance(parsed, dict):
+                current_date = datetime(2025, 3, 20)
+                followup_date = datetime.strptime(parsed["date"], "%Y-%m-%d")
+                if followup_date <= current_date:
+                    days_to_add = 7 if "week" in parsed["text"].lower() else 5
+                    parsed["date"] = (current_date + timedelta(days=days_to_add)).strftime("%Y-%m-%d")
+                return parsed
             return parsed
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse JSON for {field}: {text}")
     
     if field == "diet_instructions":
-        return [{"text": text.strip().strip('"')}]
+        return [{"text": text.strip().lstrip(':')}] 
     
     return None
 
 def refine_special_fields(data):
-    """Refine allergies, medications, and investigations by searching collections with keywords"""
+    """Refine allergies, medications, and investigations with embeddings for medications"""
     if "allergies" in data and data["allergies"]:
         refined_allergies = []
         for allergy in data["allergies"]:
@@ -324,9 +426,12 @@ def refine_special_fields(data):
         for med in data["medications"]:
             name = med.get("name", "")
             if name:
-                refined = search_collection(medications_collection, name)
+                refined = search_collection(medications_collection, name, use_embeddings=True)
                 refined_meds.append(refined)
         data["medications"] = refined_meds
+        interactions = check_drug_interactions(data["medications"])
+        if interactions:
+            data["drug_interactions"] = interactions
     
     if "investigations" in data and data["investigations"]:
         refined_invs = []
@@ -360,6 +465,8 @@ Patient Information:
             base_context += f"- Previous investigations: {', '.join(doctor_prefs['investigations'][:5])}\n"
         if field == "medications" and doctor_prefs.get('medications'):
             base_context += f"- Previous medications: {', '.join(doctor_prefs['medications'][:3])}\n"
+        if field == "allergies" and doctor_prefs.get('allergies'):
+            base_context += f"- Previous allergies: {', '.join(doctor_prefs['allergies'][:3])}\n"
         if doctor_prefs.get('diet_instructions'):
             base_context += f"- Previous diet instructions: {doctor_prefs['diet_instructions'][0][:50]}...\n"
         if doctor_prefs.get('followup'):
@@ -368,15 +475,73 @@ Patient Information:
     prompts = {
         "diagnosis": f"{base_context}\nProvide the most likely diagnosis based on current complaints and history.\nOutput format: [{{\"code\": \"ICD_CODE\", \"name\": \"DIAGNOSIS_NAME\"}}]\n{format_examples('diagnosis')}",
         "investigations": f"{base_context}\nProvide a concise, relevant list of investigations for the current condition.\nOutput format: [{{\"code\": \"\", \"name\": \"TEST_NAME\"}}]\n{format_examples('investigations')}",
-        "medications": f"{base_context}\nProvide a list of medications based on the patient's current complaints and history.\nOutput format: [{{\"code\": \"\", \"name\": \"MED_NAME\"}}]\n{format_examples('medications')}",
-        "followup": f"{base_context}\nProvide a followup plan based on current condition.\nOutput format: {{\"date\": \"YYYY-MM-DD\", \"text\": \"INSTRUCTIONS\"}}\n{format_examples('followup')}",
-        "diet_instructions": f"{base_context}\nProvide concise diet instructions relevant to current condition as a single line.\nOutput format: \"INSTRUCTIONS\"\n{format_examples('diet_instructions')}"
+        "medications": f"{base_context}\nProvide a list of unique medications (no duplicates) based on the patient's current complaints and history.\nOutput format: [{{\"code\": \"\", \"name\": \"MED_NAME\"}}]\n{format_examples('medications')}",
+        "followup": f"{base_context}\nProvide a followup plan based on current condition with a date after March 20, 2025.\nOutput format: {{\"date\": \"YYYY-MM-DD\", \"text\": \"INSTRUCTIONS\"}}\n{format_examples('followup')}",
+        "diet_instructions": f"{base_context}\nProvide concise diet instructions relevant to current condition as a single line.\nOutput format: \"INSTRUCTIONS\"\n{format_examples('diet_instructions')}",
+        "allergies": f"{base_context}\nProvide a list of unique potential allergens (no duplicates, e.g., pollen, peanuts, dust mites, not diseases) based on the patient's current complaints.\nOutput format: [{{\"code\": \"\", \"name\": \"ALLERGY_NAME\"}}]\n{format_examples('allergies')}"
     }
     
     return prompts.get(field, "")
 
+def generate_field_suggestions(data):
+    """Generate dynamic suggestions for each field using LLM"""
+    suggestions = {}
+    chief_complaints = data.get("chief_complaints", [{"text": ""}])[0].get("text", "")
+    if not chief_complaints or not validate_chief_complaints(chief_complaints):
+        return suggestions
+
+    fields_to_check = ["diagnosis", "medications", "investigations", "allergies", "diet_instructions", "vitals", "followup"]
+    
+    for field in fields_to_check:
+        field_data = data.get(field, None)
+        if field_data is None:
+            continue
+
+        # Prepare field-specific context
+        if field == "diagnosis":
+            current_value = json.dumps(field_data) if field_data else "[]"
+        elif field == "medications" or field == "investigations" or field == "allergies":
+            current_value = json.dumps(field_data) if field_data else "[]"
+        elif field == "diet_instructions":
+            current_value = field_data[0].get("text", "") if isinstance(field_data, list) and field_data else ""
+        elif field == "vitals":
+            current_value = json.dumps(field_data) if field_data else "[]"
+        elif field == "followup":
+            current_value = json.dumps(field_data) if field_data else "{}"
+        else:
+            continue
+
+        # Use string concatenation instead of f-string to avoid format specifier issues
+        prompt = (
+            "You are an expert Medical AI assistant. Your task is to review the patient's current " + field + " data and provide a concise suggestion or warning for the doctor if there are any potential issues, inconsistencies, or improvements needed based on the chief complaints. If the data seems appropriate, return \"No issues detected.\"\n\n" +
+            "Patient Information:\n" +
+            "- Chief complaints: " + chief_complaints + "\n" +
+            "- Current " + field + ": " + current_value + "\n\n" +
+            "Instructions:\n" +
+            "- Provide a single, concise sentence as a suggestion or warning.\n" +
+            "- Focus on medical relevance, appropriateness, or potential errors.\n" +
+            "- If the data is empty or seems correct, return \"No issues detected.\"\n" +
+            "- Output format: \"SUGGESTION_TEXT\"\n\n" +
+            "Examples:\n" +
+            "- Input: Chief complaints: \"High blood pressure\", Current medications: [{\"code\": \"\", \"name\": \"Amlodipine\"}]\n" +
+            "  Output: \"No issues detected.\"\n" +
+            "- Input: Chief complaints: \"severe pain in the lungs and fever\", Current medications: [{\"code\": \"\", \"name\": \"Anistreplase\"}]\n" +
+            "  Output: \"Anistreplase is not indicated for lung pain or fever; consider antibiotics.\"\n" +
+            "- Input: Chief complaints: \"chest pain\", Current vitals: [{\"bp\": {\"systolic\": \"60\", \"diastolic\": \"1000\"}}]\n" +
+            "  Output: \"Blood pressure values are likely erroneous; please verify.\""
+        )
+        
+        llm_output = get_llm_suggestion(prompt)
+        if llm_output:
+            suggestion = llm_output.strip('"')
+            if suggestion and suggestion != "No issues detected.":
+                suggestions[field] = suggestion
+            logger.info(f"LLM suggestion for {field}: {suggestion}")
+
+    return suggestions
+
 def process_json_data(data):
-    """Process input JSON and return completed data"""
+    """Process input JSON and return completed data with suggestions"""
     result = data.copy()
     patient_id = result.get("patientId")
     doctor_id = result.get("doctorId")
@@ -385,12 +550,10 @@ def process_json_data(data):
         logger.error("Missing patientId or doctorId")
         return {"error": "Missing patientId or doctorId"}, 400
 
-    # Step 1: Fetch patient history and fill patient sections
     past_visits = fetch_patient_history(patient_id)
-    patient_details = extract_patient_details(past_visits)
+    patient_details = extract_patient_details(past_visits, result)
     result.update(patient_details)
 
-    # Step 2: Handle chief complaints and validate
     chief_complaints = ""
     if "chief_complaints" in result:
         if isinstance(result["chief_complaints"], dict):
@@ -403,17 +566,15 @@ def process_json_data(data):
         logger.info(f"Invalid chief complaints: '{chief_complaints}'")
         return result
 
-    # Step 3: Fetch doctor preferences
     doctor_prefs = fetch_doctor_preferences(doctor_id, chief_complaints)
 
-    # Step 4: Process fields with LLM
-    doctor_fields = ["diagnosis", "investigations", "medications", "followup", "diet_instructions"]
+    doctor_fields = ["diagnosis", "investigations", "medications", "followup", "diet_instructions", "allergies"]
     for field in doctor_fields:
         is_empty = (field not in result or 
                     (isinstance(result[field], list) and not result[field]) or 
                     (isinstance(result[field], str) and not result[field].strip()) or 
                     (isinstance(result[field], dict) and not any(result[field].values())))
-        if is_empty:
+        if is_empty or (field == "allergies" and result[field] == [{"code": "", "name": ""}]):
             prompt = generate_prompt(field, result, doctor_prefs)
             if prompt:
                 llm_output = get_llm_suggestion(prompt)
@@ -426,7 +587,6 @@ def process_json_data(data):
                             result[field] = processed_output
                         logger.info(f"Set {field} to: {result[field]}")
 
-    # Step 5: Refine diagnosis with ICD-11 API
     if "diagnosis" in result and result["diagnosis"]:
         diagnosis_name = result["diagnosis"][0].get("name", "") if isinstance(result["diagnosis"], list) else result["diagnosis"].get("name", "")
         if diagnosis_name:
@@ -434,8 +594,11 @@ def process_json_data(data):
             if api_diagnosis:
                 result["diagnosis"] = [api_diagnosis]
 
-    # Step 6: Refine allergies, medications, and investigations with keyword search
     result = refine_special_fields(result)
+
+    # Generate dynamic suggestions using LLM
+    suggestions = generate_field_suggestions(result)
+    result["suggestions"] = suggestions
 
     return result
 
@@ -445,15 +608,32 @@ def suggest():
     try:
         data = request.json
         if not data or "patientId" not in data or "doctorId" not in data:
-            return jsonify({"error": "Missing patientId or doctorId"}), 400
+            return jsonify({
+                "status": False,
+                "data": {},
+                "message": "Missing patientId or doctorId in request"
+            }), 400
         
         completed_data = process_json_data(data)
         if isinstance(completed_data, tuple):
-            return jsonify(completed_data[0]), completed_data[1]
-        return jsonify(completed_data)
+            return jsonify({
+                "status": False,
+                "data": completed_data[0],
+                "message": "Invalid input data provided"
+            }), completed_data[1]
+        
+        return jsonify({
+            "status": True,
+            "data": completed_data,
+            "message": "Suggestions generated successfully"
+        })
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "status": False,
+            "data": {},
+            "message": f"Error occurred: {str(e)}"
+        }), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
