@@ -282,10 +282,21 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
         return {}
     
     try:
-        visits = patient_visits_collection.find({"doctorId": ObjectId(doctor_id)}).sort("createdAt", -1).limit(50)
+        # Focus on most recent 10 records for more relevant suggestions
+        visits = patient_visits_collection.find({"doctorId": ObjectId(doctor_id)}).sort("createdAt", -1).limit(10)
         doctor_visits = list(visits)
         
-        preferences = {"diagnosis": [], "investigations": [], "medications": [], "diet_instructions": [], "followup": [], "scores":[], "conditions":[]}
+        preferences = {
+            "diagnosis": [], 
+            "investigations": [], 
+            "medications": [], 
+            "diet_instructions": [], 
+            "followup": [], 
+            "scores": [],
+            "visit_similarities": [], # Store complete visit similarities
+            "chief_complaints": []    # Store the original chief complaints
+        }
+        
         current_embedding = semantic_model.encode(chief_complaints.lower(), convert_to_tensor=True)
         
         for visit in doctor_visits:
@@ -296,26 +307,34 @@ def fetch_doctor_preferences(doctor_id, chief_complaints):
             visit_embedding = semantic_model.encode(visit_complaints, convert_to_tensor=True)
             similarity = util.cos_sim(current_embedding, visit_embedding).item()
             
-            # Only consider highly similar conditions to avoid inappropriate medication suggestions
-            if similarity > 0.6:  # Increased threshold to ensure better relevance
-                # Store the condition along with every medication to provide context 
-                if "medications" in visit and visit["medications"]:
-                    medications = [item["name"] for item in visit["medications"]] if isinstance(visit["medications"], list) else visit["medications"]
-                    preferences["medications"].extend(medications)
-                    preferences["conditions"].extend([visit_complaints] * len(medications))
-                    preferences['scores'].extend([similarity] * len(medications))
-                
-                # Still collect these for reference
+            # Store the visit with its similarity and chief complaints for later processing
+            preferences["visit_similarities"].append({
+                "similarity": similarity,
+                "chief_complaints": visit_complaints,
+                "visit": visit,
+                "medications": visit.get("medications", [])
+            })
+            
+            # Still collect other preferences for reference
+            if similarity > 0.5:
                 if "diagnosis" in visit and visit["diagnosis"]:
                     preferences["diagnosis"].extend(visit["diagnosis"])
                 if "investigations" in visit and visit["investigations"]:
                     investigations = [item["name"] for item in visit["investigations"]] if isinstance(visit["investigations"], list) else visit["investigations"]
                     preferences["investigations"].extend(investigations)
+                if "medications" in visit and visit["medications"]:
+                    medications = [item["name"] for item in visit["medications"]] if isinstance(visit["medications"], list) else visit["medications"]
+                    preferences["medications"].extend(medications)
+                    preferences['scores'].extend([similarity] * len(medications))
+                    preferences['chief_complaints'].extend([visit_complaints] * len(medications))
                 if "diet_instructions" in visit and visit["diet_instructions"]:
                     content = visit["diet_instructions"][0]["text"] if isinstance(visit["diet_instructions"], list) and visit["diet_instructions"] else visit["diet_instructions"]
                     preferences["diet_instructions"].append(content)
                 if "followup" in visit and visit["followup"]:
                     preferences["followup"].append(visit["followup"])
+        
+        # Sort visits by similarity score in descending order
+        preferences["visit_similarities"].sort(key=lambda x: x["similarity"], reverse=True)
         
         return preferences
     except Exception as e:
@@ -335,7 +354,7 @@ def process_llm_output(text, field):
             return [{"code": "", "name": "Paracetamol"}]
         return None
     
-    text = re.sub(r'^(INSTRUCTIONS|Output:)\s*', '', text.strip(), flags=re.IGNORECASE)
+    text = re.sub(r'^(INSTRUCTIONS|Output:)\s*', '', text.strip(), re.IGNORECASE)
     text = text.strip('"').lstrip(':').strip()  # Ensure colon is removed at the start
     
     if field in ["medications"]:
@@ -508,8 +527,92 @@ def process_json_data(data):
         return result
         
     doctor_prefs = fetch_doctor_preferences(doctor_id, chief_complaints)
-    doctor_fields = ["diagnosis", "investigations", "medications", "followup", "diet_instructions"]
+    doctor_fields = ["diagnosis", "investigations", "followup", "diet_instructions"]
     
+    # New medication approach: First check for highly similar past visits
+    similar_medications = []
+    found_similar_visit = False
+    
+    # Check if there's any visit with high similarity (> 0.6)
+    if "visit_similarities" in doctor_prefs and doctor_prefs["visit_similarities"]:
+        for visit_info in doctor_prefs["visit_similarities"]:
+            if visit_info["similarity"] > 0.6:
+                found_similar_visit = True
+                visit_meds = visit_info["medications"]
+                
+                if isinstance(visit_meds, list):
+                    for med in visit_meds:
+                        if isinstance(med, dict):
+                            med_name = med.get("name", "")
+                            if med_name and med_name not in [m.get("name", "") for m in similar_medications]:
+                                similar_medications.append({"code": med.get("code", ""), "name": med_name})
+                        elif isinstance(med, str) and med not in [m.get("name", "") for m in similar_medications]:
+                            similar_medications.append({"code": "", "name": med})
+                
+                logger.info(f"Found highly similar visit with similarity {visit_info['similarity']:.2f}")
+                logger.info(f"Similar chief complaints: {visit_info['chief_complaints']}")
+                logger.info(f"Current chief complaints: {chief_complaints}")
+                logger.info(f"Extracted medications: {[m.get('name', '') for m in similar_medications]}")
+                break  # Only use the most similar visit
+    
+    # Set the medications based on past similar visit or ask the LLM
+    if found_similar_visit and similar_medications:
+        result["medications"] = similar_medications
+        logger.info(f"Set medications from similar past visit: {result['medications']}")
+        
+        # Ask LLM to review and potentially add medications
+        review_prompt = f"""
+You are a medical professional reviewing a medication list for a patient with the following chief complaints:
+"{chief_complaints}"
+
+The patient was prescribed these medications previously for a similar condition:
+{[med.get('name', '') for med in similar_medications]}
+
+Your task is to:
+1. Review if these medications are appropriate for the current complaints
+2. Add any essential medications that might be missing for the current condition
+3. DO NOT remove any medications from the list, only add if necessary
+4. Return a complete list of medications in JSON format
+
+Output format: [{{\"code\": \"\", \"name\": \"MED_NAME\"}}]
+"""
+        llm_output = get_llm_suggestion(review_prompt)
+        if llm_output:
+            processed_output = process_llm_output(llm_output, "medications")
+            if processed_output:
+                # Deduplicate while preserving order
+                seen_meds = set()
+                unique_meds = []
+                
+                # Start with the medications from the similar past visit
+                for med in similar_medications:
+                    name = med.get("name", "").lower()
+                    if name and name not in seen_meds:
+                        seen_meds.add(name)
+                        unique_meds.append(med)
+                
+                # Add any new medications from the LLM
+                for med in processed_output:
+                    name = med.get("name", "").lower()
+                    if name and name not in seen_meds:
+                        seen_meds.add(name)
+                        unique_meds.append(med)
+                
+                result["medications"] = unique_meds
+                logger.info(f"Updated medications after LLM review: {[m.get('name', '') for m in result['medications']]}")
+    else:
+        # No similar past visit found, use the regular LLM approach for medications
+        logger.info("No similar past visit found. Using LLM for medication suggestions.")
+        prompt = generate_prompt("medications", result, doctor_prefs)
+        if prompt:
+            llm_output = get_llm_suggestion(prompt)
+            if llm_output:
+                processed_output = process_llm_output(llm_output, "medications")
+                if processed_output:
+                    result["medications"] = processed_output
+                    logger.info(f"Set medications from LLM: {result['medications']}")
+    
+    # Process the other fields normally
     for field in doctor_fields:
         is_empty = (field not in result or 
                     (isinstance(result[field], list) and not result[field]) or 
@@ -546,39 +649,6 @@ def process_json_data(data):
     # Ensure branchId and organizationId are preserved
     result["branchId"] = branchId
     result["organizationId"] = organizationId
-    
-    # Use doctor preferences for medications more intelligently
-    if doctor_prefs.get("medications") and doctor_prefs.get("scores") and doctor_prefs.get("conditions"):
-        # Only consider using previous medications in very specific cases
-        # Primarily rely on the LLM to generate appropriate medications for current condition
-        existing_medications = [med["name"] for med in result["medications"]] if "medications" in result and result["medications"] else []
-        
-        # Check if we need to add a medication from past preferences
-        if existing_medications:
-            # Only look at the most similar past case with similarity over 0.7 (very similar)
-            # Get indices of items with scores > 0.7
-            high_similarity_indices = [i for i, score in enumerate(doctor_prefs["scores"]) if score > 0.7]
-            
-            if high_similarity_indices:
-                # Extract medications with high similarity
-                high_similarity_meds = [doctor_prefs["medications"][i] for i in high_similarity_indices]
-                high_similarity_conditions = [doctor_prefs["conditions"][i] for i in high_similarity_indices]
-                
-                logger.info(" -----------  ------------  ------------")
-                logger.info(f"Found {len(high_similarity_meds)} highly similar past medications")
-                logger.info(f"Current complaints: {chief_complaints}")
-                logger.info(f"Similar past conditions: {list(set(high_similarity_conditions))}")
-                logger.info(" -----------  ------------  ------------")
-                
-                # Check for medications that would be relevant but aren't yet included
-                # Limit to just one additional medication to avoid over-medication
-                existing_meds_set = {med.lower() for med in existing_medications}
-                for med in high_similarity_meds:
-                    if med.lower() not in existing_meds_set:
-                        # Add only one past medication and break
-                        result["medications"].append({"code": "", "name": med})
-                        logger.info(f"Added medication from past: {med}")
-                        break
     
     result = refine_special_fields(result)
     
