@@ -167,7 +167,7 @@ def generate_medical_history_summary(patient_id, org_id):
         logger.error(f"Error generating medical history summary: {str(e)}")
         return ""
 
-@app.route('/api/patient_medical_history', methods=['POST'])
+@app.route('/api/past_medical_history', methods=['POST'])
 def get_patient_medical_history():
     """API endpoint to return medical history summary for a patient"""
     try:
