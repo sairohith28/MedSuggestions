@@ -187,6 +187,7 @@ def search_collection(collection, search_term, field="name", use_embeddings=Fals
                     "$project": {
                         "_id": 1,
                         "name": 1,
+                        "code": 1,
                         "score": {"$meta": "vectorSearchScore"}
                     }
                 }
@@ -195,7 +196,9 @@ def search_collection(collection, search_term, field="name", use_embeddings=Fals
             if results:
                 top_match = results[0]
                 if top_match.get("score") >= 0.7:
-                    return {"code": str(top_match["_id"]), "name": top_match["name"]}
+                    # Use code field if available, fall back to _id if not
+                    code_value = top_match.get("code", str(top_match["_id"]))
+                    return {"code": code_value, "name": top_match["name"]}
             return {"code": "", "name": search_term}
 
         regex_pattern = re.compile(re.escape(search_term), re.IGNORECASE)
@@ -208,7 +211,9 @@ def search_collection(collection, search_term, field="name", use_embeddings=Fals
 
         result = collection.find_one(query)
         if result:
-            return {"code": str(result["_id"]), "name": result["name"]}
+            # Use code field if available, fall back to _id if not
+            code_value = result.get("code", str(result["_id"]))
+            return {"code": code_value, "name": result["name"]}
         return {"code": "", "name": search_term}
     except Exception as e:
         logger.error(f"Error searching collection {collection.name}: {str(e)}")
