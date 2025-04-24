@@ -666,6 +666,77 @@ Output format: [{{\"code\": \"\", \"name\": \"MED_NAME\"}}]
 
     return result
 
+def filter_unchanged_fields(input_data, output_data):
+    """Filter out fields that haven't changed between input and output"""
+    result = output_data.copy()
+    
+    for key, output_value in output_data.items():
+        if key not in input_data:
+            # Keep new fields that weren't in the input
+            continue
+            
+        input_value = input_data.get(key)
+        
+        # Special handling for chief_complaints
+        if key == "chief_complaints":
+            # Get text content regardless of format
+            if isinstance(output_value, list) and output_value and isinstance(output_value[0], dict):
+                output_text = output_value[0].get("text", "")
+            else:
+                output_text = output_value
+                
+            # Compare with input text regardless of format
+            if isinstance(input_value, list) and input_value and isinstance(input_value[0], dict):
+                input_text = input_value[0].get("text", "")
+            elif isinstance(input_value, dict):
+                input_text = input_value.get("text", "")
+            else:
+                input_text = input_value
+                
+            # If content is the same, remove from result
+            if str(output_text).strip() == str(input_text).strip():
+                result[key] = []
+            continue
+            
+        # Compare based on field type
+        if isinstance(output_value, list) and isinstance(input_value, list):
+            # For list fields (medications, investigations, diet_instructions)
+            if key in ["medications", "investigations"]:
+                # Compare based on name property
+                output_names = sorted([item.get("name", "").lower() for item in output_value if isinstance(item, dict)])
+                input_names = sorted([item.get("name", "").lower() for item in input_value if isinstance(item, dict)])
+                if output_names == input_names:
+                    # Names match exactly, clear the field
+                    result[key] = []
+            
+            elif key == "diet_instructions":
+                # Compare text content of first item
+                output_text = output_value[0].get("text", "") if output_value and isinstance(output_value[0], dict) else ""
+                input_text = input_value[0].get("text", "") if input_value and isinstance(input_value[0], dict) else ""
+                if output_text == input_text:
+                    result[key] = []
+                    
+            else:
+                # Generic list comparison
+                if json.dumps(output_value) == json.dumps(input_value):
+                    result[key] = []
+        
+        # Handle case where input is string but output is a list object (another chief_complaints case)
+        elif isinstance(output_value, list) and isinstance(input_value, str):
+            if output_value and isinstance(output_value[0], dict) and output_value[0].get("text", "") == input_value:
+                result[key] = []
+                    
+        elif isinstance(output_value, dict) and isinstance(input_value, dict):
+            # For dictionary fields (followup)
+            if json.dumps(output_value) == json.dumps(input_value):
+                result[key] = {}
+                
+        elif output_value == input_value:
+            # For simple value fields
+            result[key] = "" if isinstance(output_value, str) else None
+    
+    return result
+
 @app.route('/api/suggest', methods=['POST'])
 def suggest():
     """API endpoint to process input and provide suggestions"""
@@ -678,6 +749,7 @@ def suggest():
                 "message": "Missing patientId or doctorId in request"
             }), 400
             
+        # Process the data to get suggestions
         completed_data = process_json_data(data)
         if isinstance(completed_data, tuple):
             return jsonify({
@@ -686,9 +758,13 @@ def suggest():
                 "message": "Invalid input data provided"
             }), completed_data[1]
         
+        # Filter out fields that haven't changed from the input
+        filtered_data = filter_unchanged_fields(data, completed_data)
+        logger.info(f"Filtered response, removed {len(completed_data) - len(filtered_data)} unchanged fields")
+        
         return jsonify({
             "status": True,
-            "data": completed_data,
+            "data": filtered_data,
             "message": "Suggestions generated successfully"
         })
     except Exception as e:
