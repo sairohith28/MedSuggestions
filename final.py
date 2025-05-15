@@ -31,7 +31,7 @@ drug_interactions_collection = db["drug-interactions"]
 investigations_collection = db["investigations"]
 
 # LLM API endpoint and authorization
-LLM_API_URL = os.getenv("LLM_API_URL")
+LLM_API_URL = os.getenv("14B_URL")
 LLM_AUTH_HEADER = os.getenv("LLM_AUTH_HEADER")
 
 
@@ -82,7 +82,7 @@ def get_llm_suggestion(prompt):
     """Fetch suggestion from LLM API"""
     headers = {"Authorization": LLM_AUTH_HEADER, "Content-Type": "application/json"}
     payload = {
-        "model": "unsloth/Qwen2.5-1.5B-Instruct",
+        "model": "Qwen/Qwen2.5-14B-Instruct-AWQ",
         "messages": [{"role": "system", "content": "You are an expert Medical AI assistant. Provide structured outputs without explanations, matching the specified format exactly."}, {"role": "user", "content": prompt}],
         "max_tokens": 500,
         "temperature": 0.2,
@@ -399,7 +399,7 @@ def extract_patient_details(past_visits, input_data=None):
         {"role": "user", "content": medical_history_summarizer_prompt},
     ]
     medication_response = requests.post(
-            "http://203.112.158.104:5006/v1/chat/completions",
+            os.getenv("UNSLOTH_API_URL"),
             json={
                 "model": "unsloth/Qwen2.5-1.5B-Instruct",
                 "messages": messages,
@@ -431,9 +431,9 @@ def extract_patient_details(past_visits, input_data=None):
         {"role": "user", "content": allergy_summarizer_prompt},
     ]
     allergy_response = requests.post(
-                "http://203.112.158.104:5006/v1/chat/completions",
+                os.getenv("14B_URL"),
                 json={
-                    "model": "unsloth/Qwen2.5-1.5B-Instruct",
+                    "model": "Qwen/Qwen2.5-14B-Instruct-AWQ",
                     "messages": messages,
                 },
                 headers={"Authorization": "Bearer apex@#1"},
