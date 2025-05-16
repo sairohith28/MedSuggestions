@@ -31,7 +31,7 @@ drug_interactions_collection = db["drug-interactions"]
 investigations_collection = db["investigations"]
 
 # LLM API endpoint and authorization
-LLM_API_URL = os.getenv("UNSLOTH_API_URL")
+LLM_API_URL = os.getenv("24GB_URL")
 LLM_AUTH_HEADER = os.getenv("LLM_AUTH_HEADER")
 
 # Semantic model
@@ -80,11 +80,50 @@ def format_examples(field):
 def get_llm_suggestion(prompt):
     """Fetch suggestion from LLM API"""
     headers = {"Authorization": LLM_AUTH_HEADER, "Content-Type": "application/json"}
+    
+    # Completely redesigned system prompt with explicit formatting instructions and guardrails
+    system_prompt = """You are a clinical decision support AI for medical professionals. You MUST adhere to THESE EXACT RULES:
+
+1. ONLY return the EXACT data format requested with NO explanations, NO thinking, NO reasoning, NO extra text
+2. DO NOT include ANY text like "Let me think", "First", "Looking at", "Based on", "I'll", "Now", etc.
+3. DO NOT include ANY tags like <think> or similar
+4. For each field, return ONLY valid medical data in the EXACT format shown in examples
+5. NEVER include reasoning text like "considering the symptoms" or "the patient has"
+6. NEVER include fragments of your thinking process in the responses
+
+For DIAGNOSIS:
+- Only include medically valid diagnoses for the symptoms
+- Format MUST be: [{"code": "", "name": "Diagnosis Name"}]
+- Example: [{"code": "I10", "name": "Essential hypertension"}]
+
+For INVESTIGATIONS:
+- Only include relevant medical tests for the condition
+- Format MUST be: [{"code": "", "name": "Test Name"}]
+- Example: [{"code": "", "name": "ECG"}, {"code": "", "name": "Cardiac Enzymes"}]
+
+For MEDICATIONS:
+- Only include appropriate medications for the diagnosis
+- Format MUST be: [{"code": "", "name": "Medication Name"}]
+- Example: [{"code": "MED-ASPIRIN", "name": "Aspirin"}, {"code": "MED-ATORVASTATIN", "name": "Atorvastatin"}]
+
+For FOLLOWUP:
+- Include valid future date and relevant instructions
+- Format MUST be: {"date": "YYYY-MM-DD", "text": "Follow-up instructions"}
+- Example: {"date": "2025-05-21", "text": "Return with test results"}
+
+For DIET_INSTRUCTIONS:
+- Include single relevant diet instruction for the condition
+- Format MUST be a simple string: "Diet instruction text"
+- Example: "Low sodium diet, avoid fatty foods, increase potassium intake"
+
+Remember: Return ONLY the requested data in the EXACT format shown. NO extra text or explanations are allowed.
+"""
+    
     payload = {
-        "model": "unsloth/Qwen2.5-1.5B-Instruct",
-        "messages": [{"role": "system", "content": "You are an expert Medical AI assistant. Provide structured outputs without explanations, matching the specified format exactly."}, {"role": "user", "content": prompt}],
+        "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
         "max_tokens": 500,
-        "temperature": 0.2,
+        "temperature": 0.1,  # Reduced temperature for more precise outputs
         "seed": 42
     }
     try:
@@ -351,6 +390,103 @@ def extract_patient_details(past_visits, input_data=None):
     # Return empty object as we're removing all these fields
     return {}
 
+def strip_thinking_sections(text):
+    """Remove thinking/reasoning sections from model output more aggressively"""
+    if not text:
+        return ""
+        
+    # Remove <think>...</think> blocks
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    
+    # Remove any content between </think> and the next valuable content
+    text = re.sub(r'</think>\s*(.*?)(\n\n|\[|\{)', r'\2', text, flags=re.DOTALL)
+    
+    # Remove common reasoning patterns with more specific matches
+    patterns_to_remove = [
+        r'Let me think about.*?(?=\n\n|\Z)', 
+        r'I need to.*?(?=\n\n|\Z)',
+        r'(?i)okay,?\s+.*?(?=\n\n|\Z)',
+        r'(?i)first,?\s+.*?(?=\n\n|\Z)',
+        r'(?i)next,?\s+.*?(?=\n\n|\Z)',
+        r'(?i)now,?\s+.*?(?=\n\n|\Z)',
+        r'(?i)so,?\s+.*?(?=\n\n|\Z)',
+        r'(?i)looking at.*?(?=\n\n|\Z)',
+        r'(?i)considering.*?(?=\n\n|\Z)',
+        r'(?i)the patient\'s.*?(?=\n\n|\Z)',
+        r'(?i)based on.*?(?=\n\n|\Z)',
+        r'(?i)in example.*?(?=\n\n|\Z)',
+        r'(?i)for instance.*?(?=\n\n|\Z)',
+        r'(?i)I\'ll.*?(?=\n\n|\Z)',
+        r'(?i)I should.*?(?=\n\n|\Z)'
+    ]
+    
+    for pattern in patterns_to_remove:
+        text = re.sub(pattern, '', text, flags=re.DOTALL)
+    
+    # Remove any line that starts with reasoning indicators (more extensive list)
+    lines = text.split('\n')
+    filtered_lines = []
+    reasoning_indicators = [
+        'i think', 'i need to', 'let me', 'i should', 'i\'ll', 'i will', 
+        'first,', 'second,', 'third,', 'finally,', 'to summarize', 
+        'in conclusion', 'to start', 'my approach', 'considering', 
+        'looking at', 'based on', 'the patient', 'this is', 'here', 
+        'for example', 'each medication', 'now i', 'next', 'so,', 'okay', 
+        'in example', 'for instance', 'that sounds', 'maybe', 'possibly',
+        'which is', 'just the', 'the user'
+    ]
+    
+    skip_current_paragraph = False
+    for line in lines:
+        line_lower = line.lower().strip()
+        
+        # Skip empty lines
+        if not line_lower:
+            filtered_lines.append(line)
+            skip_current_paragraph = False
+            continue
+            
+        # Check if line starts with a reasoning indicator
+        if any(line_lower.startswith(indicator) for indicator in reasoning_indicators):
+            skip_current_paragraph = True
+            continue
+            
+        # If in skip mode and not an empty line, continue skipping
+        if skip_current_paragraph and line_lower:
+            continue
+            
+        # Check if line contains common reasoning words anywhere
+        reasoning_words = ['would be', 'should be', 'i think', 'i believe', 'probably', 'might be']
+        if any(word in line_lower for word in reasoning_words):
+            continue
+            
+        filtered_lines.append(line)
+    
+    # Join remaining lines and clean up whitespace
+    text = '\n'.join(filtered_lines)
+    
+    # Clean up excess whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)  # Replace 3+ newlines with 2
+    text = re.sub(r'[ \t]+\n', '\n', text)  # Remove trailing spaces
+    text = re.sub(r'\n[ \t]+', '\n', text)  # Remove leading spaces on lines
+    
+    # Clean up any JSON fragments (partial JSON responses)
+    if '[' in text and not ']' in text:
+        text = re.sub(r'\[.*$', '', text)
+    if '{' in text and not '}' in text:
+        text = re.sub(r'\{.*$', '', text)
+    
+    # Remove anything before a JSON structure if it exists
+    json_match = re.search(r'(\[.*\]|\{.*\})', text, re.DOTALL)
+    if json_match:
+        text = json_match.group(0)
+        
+    # Remove any non-standard quotes that might break JSON parsing
+    text = text.replace('"', '"').replace('"', '"')
+    
+    # Strip final result
+    return text.strip()
+
 def process_llm_output(text, field):
     """Process LLM output into structured format"""
     if not text:
@@ -359,65 +495,101 @@ def process_llm_output(text, field):
             return [{"code": "", "name": "Paracetamol"}]
         return None
     
+    # Strip thinking sections
+    text = strip_thinking_sections(text)
+    
+    # Remove standard prefixes
     text = re.sub(r'^(INSTRUCTIONS|Output:)\s*', '', text.strip(), re.IGNORECASE)
     text = text.strip('"').lstrip(':').strip()  # Ensure colon is removed at the start
     
-    if field in ["medications"]:
-        json_pattern = r'\[.*\]'
-        match = re.search(json_pattern, text, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-                items = [{"code": "", "name": item["name"]} for item in parsed if isinstance(item, dict) and "name" in item]
-                seen = set()
-                items = [item for item in items if not (item["name"] in seen or seen.add(item["name"]))]
-                return items
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse JSON for {field}: {text}")
-        
-        items = []
-        for part in text.split("},"):
-            name_match = re.search(r'"name":\s*"([^"]+)"', part)
-            if name_match:
-                items.append({"code": "", "name": name_match.group(1)})
-        seen = set()
-        items = [item for item in items if not (item["name"] in seen or seen.add(item["name"]))]
-        return items if items else [{"code": "", "name": "Paracetamol" if field == "medications" else ""}]
-    
-    if field == "investigations":
-        json_pattern = r'\[.*\]'
-        match = re.search(json_pattern, text, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-                if isinstance(parsed, list):
-                    return [{"code": "", "name": item["name"]} if isinstance(item, dict) else {"code": "", "name": item} for item in parsed]
-                return [{"code": "", "name": parsed}]
-            except json.JSONDecodeError:
-                pass
-        cleaned_text = [line.strip().strip('"') for line in text.split(',') if line.strip()]
-        return [{"code": "", "name": item} for item in cleaned_text] if cleaned_text else [{"code": "", "name": "CBC"}]
-    
+    # Look for JSON in the text
     json_pattern = r'\[.*\]|\{.*\}'
     match = re.search(json_pattern, text, re.DOTALL)
     if match:
         try:
             parsed = json.loads(match.group(0))
-            if field == "diet_instructions" and isinstance(parsed, str):
-                return [{"text": parsed.lstrip(':').strip()}]  # Ensure colon is removed
-            if field == "followup" and isinstance(parsed, dict):
+            
+            # Process based on field type
+            if field == "medications":
+                if isinstance(parsed, list):
+                    items = [{"code": item.get("code", ""), "name": item.get("name", item)} 
+                            for item in parsed 
+                            if isinstance(item, dict) and "name" in item or isinstance(item, str)]
+                    # Deduplicate
+                    seen = set()
+                    return [item for item in items if not (item["name"] in seen or seen.add(item["name"]))]
+                return [{"code": "", "name": "Paracetamol"}]
+                
+            elif field == "investigations":
+                if isinstance(parsed, list):
+                    return [{"code": item.get("code", ""), "name": item.get("name", item)} 
+                            for item in parsed 
+                            if isinstance(item, dict) and "name" in item or isinstance(item, str)]
+                return [{"code": "", "name": parsed}]
+                
+            elif field == "diet_instructions" and isinstance(parsed, str):
+                return [{"text": parsed.lstrip(':').strip()}]
+                
+            elif field == "followup" and isinstance(parsed, dict):
                 current_date = datetime(2025, 3, 20)
-                followup_date = datetime.strptime(parsed["date"], "%Y-%m-%d")
-                if followup_date <= current_date:
-                    days_to_add = 7 if "week" in parsed["text"].lower() else 5
-                    parsed["date"] = (current_date + timedelta(days=days_to_add)).strftime("%Y-%m-%d")
+                if "date" in parsed:
+                    try:
+                        followup_date = datetime.strptime(parsed["date"], "%Y-%m-%d")
+                        if followup_date <= current_date:
+                            days_to_add = 7 if "week" in parsed.get("text", "").lower() else 5
+                            parsed["date"] = (current_date + timedelta(days=days_to_add)).strftime("%Y-%m-%d")
+                    except:
+                        parsed["date"] = (current_date + timedelta(days=7)).strftime("%Y-%m-%d")
                 return parsed
+                
             return parsed
+            
         except json.JSONDecodeError:
             logger.warning(f"Failed to parse JSON for {field}: {text}")
     
-    if field == "diet_instructions":
-        return [{"text": text.lstrip(':').strip()}]  # Ensure colon is removed here too
+    # Fallback parsing for non-JSON outputs
+    if field == "medications":
+        # Split by commas, semicolons, or newlines and create structured items
+        separators = [',', ';', '\n']
+        for sep in separators:
+            if sep in text:
+                items = [item.strip() for item in text.split(sep) if item.strip()]
+                if items:
+                    return [{"code": "", "name": item} for item in items]
+        return [{"code": "", "name": "Paracetamol"}]
+        
+    elif field == "investigations":
+        # Split by commas, semicolons, or newlines
+        separators = [',', ';', '\n']
+        for sep in separators:
+            if sep in text:
+                items = [item.strip() for item in text.split(sep) if item.strip()]
+                if items:
+                    return [{"code": "", "name": item} for item in items]
+        return [{"code": "", "name": "CBC"}]
+        
+    elif field == "diet_instructions":
+        # Return single text instruction
+        return [{"text": text.lstrip(':').strip()}]
+        
+    elif field == "followup":
+        # Try to extract date and text
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
+        current_date = datetime(2025, 3, 20)
+        
+        if date_match:
+            date_str = date_match.group(1)
+            text_without_date = text.replace(date_str, "").strip()
+            try:
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+                if date_obj <= current_date:
+                    date_str = (current_date + timedelta(days=7)).strftime("%Y-%m-%d")
+            except:
+                date_str = (current_date + timedelta(days=7)).strftime("%Y-%m-%d")
+                
+            return {"date": date_str, "text": text_without_date}
+        else:
+            return {"date": (current_date + timedelta(days=7)).strftime("%Y-%m-%d"), "text": text}
     
     return None
 
@@ -518,7 +690,7 @@ def process_json_data(data):
         logger.error("Missing patientId or doctorId")
         return {"error": "Missing patientId or doctorId"}, 400
     
-    # Not updating patient details 
+    # Extract chief complaints
     chief_complaints = ""
     if "chief_complaints" in result:
         if isinstance(result["chief_complaints"], dict):
@@ -530,43 +702,62 @@ def process_json_data(data):
     if not validate_chief_complaints(chief_complaints):
         logger.info(f"Invalid chief complaints: '{chief_complaints}'")
         return result
+    
+    # Check for urinary tract symptoms - specialized handling - FIXED REGEX
+    has_urinary_symptoms = re.search(r'urin|urethra|bladder', chief_complaints, re.IGNORECASE)
+    if has_urinary_symptoms:
+        logger.info(f"Detected urinary symptoms in chief complaints: '{chief_complaints}'")
         
-    doctor_prefs = fetch_doctor_preferences(doctor_id, chief_complaints)
-    doctor_fields = ["diagnosis", "investigations", "followup", "diet_instructions"]
-    
-    # New medication approach: First check for highly similar past visits
-    similar_medications = []
-    found_similar_visit = False
-    
-    # Check if there's any visit with high similarity (> 0.6)
-    if "visit_similarities" in doctor_prefs and doctor_prefs["visit_similarities"]:
-        for visit_info in doctor_prefs["visit_similarities"]:
-            if visit_info["similarity"] > 0.6:
-                found_similar_visit = True
-                visit_meds = visit_info["medications"]
-                
-                if isinstance(visit_meds, list):
-                    for med in visit_meds:
-                        if isinstance(med, dict):
-                            med_name = med.get("name", "")
-                            if med_name and med_name not in [m.get("name", "") for m in similar_medications]:
-                                similar_medications.append({"code": med.get("code", ""), "name": med_name})
-                        elif isinstance(med, str) and med not in [m.get("name", "") for m in similar_medications]:
-                            similar_medications.append({"code": "", "name": med})
-                
-                logger.info(f"Found highly similar visit with similarity {visit_info['similarity']:.2f}")
-                logger.info(f"Similar chief complaints: {visit_info['chief_complaints']}")
-                logger.info(f"Current chief complaints: {chief_complaints}")
-                logger.info(f"Extracted medications: {[m.get('name', '') for m in similar_medications]}")
-                break  # Only use the most similar visit
-    
-    # Set the medications based on past similar visit or ask the LLM
-    if found_similar_visit and similar_medications:
-        result["medications"] = similar_medications
-        logger.info(f"Set medications from similar past visit: {result['medications']}")
+        # Special handling for urinary tract issues
+        result["diagnosis"] = [get_diagnosis_for_urinary_symptoms(chief_complaints)]
+        result["investigations"] = get_urinary_investigations(chief_complaints)
+        result["medications"] = get_urinary_medications(chief_complaints)
+        result["diet_instructions"] = get_urinary_diet_instructions(chief_complaints)
+        result["followup"] = {
+            "date": (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
+            "text": "Return with investigation results for follow-up."
+        }
         
-        # Ask LLM to review and potentially add medications
-        review_prompt = f"""
+        # Skip the generic LLM processing for these fields
+        doctor_fields = []
+    else:
+        # Regular processing path
+        doctor_prefs = fetch_doctor_preferences(doctor_id, chief_complaints)
+        doctor_fields = ["diagnosis", "investigations", "followup", "diet_instructions"]
+        
+        # New medication approach: First check for highly similar past visits
+        similar_medications = []
+        found_similar_visit = False
+        
+        # Check if there's any visit with high similarity (> 0.6)
+        if "visit_similarities" in doctor_prefs and doctor_prefs["visit_similarities"]:
+            for visit_info in doctor_prefs["visit_similarities"]:
+                if visit_info["similarity"] > 0.6:
+                    found_similar_visit = True
+                    visit_meds = visit_info["medications"]
+                    
+                    if isinstance(visit_meds, list):
+                        for med in visit_meds:
+                            if isinstance(med, dict):
+                                med_name = med.get("name", "")
+                                if med_name and med_name not in [m.get("name", "") for m in similar_medications]:
+                                    similar_medications.append({"code": med.get("code", ""), "name": med_name})
+                            elif isinstance(med, str) and med not in [m.get("name", "") for m in similar_medications]:
+                                similar_medications.append({"code": "", "name": med})
+                    
+                    logger.info(f"Found highly similar visit with similarity {visit_info['similarity']:.2f}")
+                    logger.info(f"Similar chief complaints: {visit_info['chief_complaints']}")
+                    logger.info(f"Current chief complaints: {chief_complaints}")
+                    logger.info(f"Extracted medications: {[m.get('name', '') for m in similar_medications]}")
+                    break  # Only use the most similar visit
+        
+        # Set the medications based on past similar visit or ask the LLM
+        if found_similar_visit and similar_medications:
+            result["medications"] = similar_medications
+            logger.info(f"Set medications from similar past visit: {result['medications']}")
+            
+            # Ask LLM to review and potentially add medications
+            review_prompt = f"""
 You are a medical professional reviewing a medication list for a patient with the following chief complaints:
 "{chief_complaints}"
 
@@ -581,60 +772,60 @@ Your task is to:
 
 Output format: [{{\"code\": \"\", \"name\": \"MED_NAME\"}}]
 """
-        llm_output = get_llm_suggestion(review_prompt)
-        if llm_output:
-            processed_output = process_llm_output(llm_output, "medications")
-            if processed_output:
-                # Deduplicate while preserving order
-                seen_meds = set()
-                unique_meds = []
-                
-                # Start with the medications from the similar past visit
-                for med in similar_medications:
-                    name = med.get("name", "").lower()
-                    if name and name not in seen_meds:
-                        seen_meds.add(name)
-                        unique_meds.append(med)
-                
-                # Add any new medications from the LLM
-                for med in processed_output:
-                    name = med.get("name", "").lower()
-                    if name and name not in seen_meds:
-                        seen_meds.add(name)
-                        unique_meds.append(med)
-                
-                result["medications"] = unique_meds
-                logger.info(f"Updated medications after LLM review: {[m.get('name', '') for m in result['medications']]}")
-    else:
-        # No similar past visit found, use the regular LLM approach for medications
-        logger.info("No similar past visit found. Using LLM for medication suggestions.")
-        prompt = generate_prompt("medications", result, doctor_prefs)
-        if prompt:
-            llm_output = get_llm_suggestion(prompt)
+            llm_output = get_llm_suggestion(review_prompt)
             if llm_output:
                 processed_output = process_llm_output(llm_output, "medications")
                 if processed_output:
-                    result["medications"] = processed_output
-                    logger.info(f"Set medications from LLM: {result['medications']}")
-    
-    # Process the other fields normally
-    for field in doctor_fields:
-        is_empty = (field not in result or 
-                    (isinstance(result[field], list) and not result[field]) or 
-                    (isinstance(result[field], str) and not result[field].strip()) or 
-                    (isinstance(result[field], dict) and not any(result[field].values())))
-        if is_empty:
-            prompt = generate_prompt(field, result, doctor_prefs)
+                    # Deduplicate while preserving order
+                    seen_meds = set()
+                    unique_meds = []
+                    
+                    # Start with the medications from the similar past visit
+                    for med in similar_medications:
+                        name = med.get("name", "").lower()
+                        if name and name not in seen_meds:
+                            seen_meds.add(name)
+                            unique_meds.append(med)
+                    
+                    # Add any new medications from the LLM
+                    for med in processed_output:
+                        name = med.get("name", "").lower()
+                        if name and name not in seen_meds:
+                            seen_meds.add(name)
+                            unique_meds.append(med)
+                    
+                    result["medications"] = unique_meds
+                    logger.info(f"Updated medications after LLM review: {[m.get('name', '') for m in result['medications']]}")
+        else:
+            # No similar past visit found, use the regular LLM approach for medications
+            logger.info("No similar past visit found. Using LLM for medication suggestions.")
+            prompt = generate_prompt("medications", result, doctor_prefs)
             if prompt:
                 llm_output = get_llm_suggestion(prompt)
                 if llm_output:
-                    processed_output = process_llm_output(llm_output, field)
-                    if processed_output is not None:
-                        if field == "diet_instructions" and isinstance(processed_output, str):
-                            result[field] = [{"text": processed_output}]
-                        else:
-                            result[field] = processed_output
-                        logger.info(f"Set {field} to: {result[field]}")
+                    processed_output = process_llm_output(llm_output, "medications")
+                    if processed_output:
+                        result["medications"] = processed_output
+                        logger.info(f"Set medications from LLM: {result['medications']}")
+        
+        # Process the other fields normally
+        for field in doctor_fields:
+            is_empty = (field not in result or 
+                        (isinstance(result[field], list) and not result[field]) or 
+                        (isinstance(result[field], str) and not result[field].strip()) or 
+                        (isinstance(result[field], dict) and not any(result[field].values())))
+            if is_empty:
+                prompt = generate_prompt(field, result, doctor_prefs)
+                if prompt:
+                    llm_output = get_llm_suggestion(prompt)
+                    if llm_output:
+                        processed_output = process_llm_output(llm_output, field)
+                        if processed_output is not None:
+                            if field == "diet_instructions" and isinstance(processed_output, str):
+                                result[field] = [{"text": processed_output}]
+                            else:
+                                result[field] = processed_output
+                            logger.info(f"Set {field} to: {result[field]}")
     
     # Check if diet_instructions is empty and set a default value
     if "diet_instructions" in result and (
@@ -655,7 +846,15 @@ Output format: [{{\"code\": \"\", \"name\": \"MED_NAME\"}}]
     result["branchId"] = branchId
     result["organizationId"] = organizationId
     
-    result = refine_special_fields(result)
+    # If not urinary symptoms, apply the regular refine process
+    if not has_urinary_symptoms:
+        result = refine_special_fields(result)
+    else:
+        # For urinary symptoms, just do drug interaction checks
+        if "medications" in result and result["medications"]:
+            interactions = check_drug_interactions(result["medications"])
+            if interactions:
+                result["drug_interactions"] = interactions
     
     # Remove keys we don't want
     keys_to_remove = ["medical_history", "personal_history", "family_history", 
@@ -687,7 +886,7 @@ def filter_unchanged_fields(input_data, output_data):
         if key == "chief_complaints":
             # Get text content regardless of format
             if isinstance(output_value, list) and output_value and isinstance(output_value[0], dict):
-                output_text = output_value[0].get("text", "")
+                output_text = output_value[0].get("text", "") 
             else:
                 output_text = output_value
                 
@@ -745,6 +944,197 @@ def filter_unchanged_fields(input_data, output_data):
             result[key] = "" if isinstance(output_value, str) else None
     
     return result
+
+def extract_structured_data(output_text, field_type):
+    """
+    Extract structured data from reasoning model output,
+    handling the verbose reasoning/thinking sections
+    """
+    cleaned_text = strip_thinking_sections(output_text)
+    
+    # Check for JSON structure first
+    json_pattern = r'\[.*\]|\{.*\}'
+    match = re.search(json_pattern, cleaned_text, re.DOTALL)
+    
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            return data
+        except json.JSONDecodeError:
+            pass  # Continue to other parsing methods
+    
+    # Handle text instructions (like diet_instructions)
+    if field_type == "diet_instructions":
+        # Look for specific format patterns
+        instruction_match = re.search(r'INSTRUCTIONS\s*\n(.*)', cleaned_text)
+        if instruction_match:
+            return instruction_match.group(1).strip()
+            
+        # Fall back to the first substantive line after cleaning
+        lines = [line for line in cleaned_text.split('\n') if line.strip()]
+        if lines:
+            return lines[0].strip()
+    
+    # Handle investigations/medications as comma-separated lists
+    if field_type in ["investigations", "medications"]:
+        if not match:  # If JSON wasn't found
+            items = []
+            # Try to find a list-like structure
+            list_patterns = [
+                r"(?:^|\n)(?:[-•*]\s*|\d+\.\s*)(.+?)(?=\n[-•*]|\n\d+\.|\Z)",  # Bullet or numbered lists
+                r"(?:^|\n)([^,\n]+(?:,[^,\n]+)+)"  # Comma-separated values
+            ]
+            
+            for pattern in list_patterns:
+                items_match = re.findall(pattern, cleaned_text, re.MULTILINE)
+                if items_match:
+                    for item in items_match:
+                        if ',' in item:
+                            items.extend([i.strip() for i in item.split(',')])
+                        else:
+                            items.append(item.strip())
+                    break
+                    
+            if not items:
+                # Last resort: try to split by newlines and commas
+                items = re.split(r'[,\n]', cleaned_text)
+                items = [item.strip() for item in items if item.strip()]
+                
+            # Convert to structured format
+            if items:
+                return [{"code": "", "name": item} for item in items if item]
+    
+    # For followup, try to extract date and text
+    if field_type == "followup":
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', cleaned_text)
+        if date_match:
+            date = date_match.group(1)
+            text = cleaned_text.replace(date, "").strip()
+            return {"date": date, "text": text}
+        else:
+            # Default to a week from current date
+            current_date = datetime(2025, 3, 20)
+            followup_date = (current_date + timedelta(days=7)).strftime("%Y-%m-%d")
+            return {"date": followup_date, "text": cleaned_text.strip()}
+    
+    # For diagnosis
+    if field_type == "diagnosis":
+        # Try to extract the diagnosis name
+        diagnosis_match = re.search(r'(?:diagnosis|condition):\s*([^\n]+)', cleaned_text, re.IGNORECASE)
+        if diagnosis_match:
+            return [{"code": "", "name": diagnosis_match.group(1).strip()}]
+            
+        # If no specific pattern, just use the first non-empty line
+        lines = [line for line in cleaned_text.split('\n') if line.strip()]
+        if lines:
+            return [{"code": "", "name": lines[0].strip()}]
+    
+    # Default fallback - return the cleaned text
+    return cleaned_text
+
+def get_diagnosis_for_urinary_symptoms(chief_complaints):
+    """Special handler for urinary tract related symptoms"""
+    # Common patterns for urinary conditions
+    urinary_patterns = [
+        (r'urin[ei].*color|orange.*urin[ei]', 'Urinary discoloration'),
+        (r'urethra.*pain|pain.*urethra', 'Urethritis'),
+        (r'burn[ing].*urinat|pain.*urinat', 'Dysuria'),
+        (r'frequent.*urinat|urgency', 'Urinary frequency'),
+        (r'blood.*urin|hematuria', 'Hematuria'),
+        (r'difficult.*urinat|strain.*urinat', 'Urinary obstruction'),
+        (r'cloudy.*urin|foul.*urin|smell.*urin', 'Urinary tract infection')
+    ]
+    
+    diagnoses = []
+    for pattern, condition in urinary_patterns:
+        if re.search(pattern, chief_complaints, re.IGNORECASE):
+            diagnoses.append(condition)
+    
+    # Return most specific diagnosis or default if none matched
+    if "Urethritis" in diagnoses:
+        return {"code": "N34.2", "name": "Urethritis"}
+    elif "Urinary tract infection" in diagnoses:
+        return {"code": "N39.0", "name": "Urinary tract infection"}
+    elif "Dysuria" in diagnoses:
+        return {"code": "R30.0", "name": "Dysuria"}
+    elif "Hematuria" in diagnoses:
+        return {"code": "R31.9", "name": "Hematuria, unspecified"}
+    elif "Urinary discoloration" in diagnoses:
+        return {"code": "R82.9", "name": "Abnormal findings in urine"}
+    elif any(diagnoses):
+        return {"code": "", "name": diagnoses[0]}
+    
+    # Default diagnosis for urinary symptoms
+    return {"code": "N39.9", "name": "Disorder of urinary system, unspecified"}
+
+def get_urinary_investigations(chief_complaints):
+    """Return appropriate investigations for urinary tract symptoms"""
+    urinary_investigations = [
+        {"code": "INV-UA", "name": "Urine Analysis"},
+        {"code": "INV-UC", "name": "Urine Culture"}
+    ]
+    
+    # Add additional tests based on specific symptoms - FIXED REGEX
+    if re.search(r'urethra.*pain|pain.*urethra|burn[ing].*urinat', chief_complaints, re.IGNORECASE):
+        urinary_investigations.append({"code": "INV-USG-KUB", "name": "Ultrasound KUB"})
+    
+    if re.search(r'blood.*urin|hematuria', chief_complaints, re.IGNORECASE):
+        urinary_investigations.append({"code": "INV-CBC", "name": "Complete Blood Count"})
+    
+    if re.search(r'color|orange|yellow', chief_complaints, re.IGNORECASE):
+        urinary_investigations.append({"code": "INV-LFT", "name": "Liver Function Test"})
+    
+    # Ensure we don't have duplicate investigations
+    unique_investigations = []
+    seen = set()
+    for inv in urinary_investigations:
+        if inv["name"].lower() not in seen:
+            seen.add(inv["name"].lower())
+            unique_investigations.append(inv)
+    
+    return unique_investigations
+
+def get_urinary_medications(chief_complaints):
+    """Return appropriate medications for urinary tract symptoms"""
+    base_medications = []
+    
+    # Common UTI medications - FIXED REGEX
+    if re.search(r'urethra.*pain|pain.*urethra|burn[ing].*urinat|cloudy|smell', chief_complaints, re.IGNORECASE):
+        base_medications.extend([
+            {"code": "MED-CIPROFLOXACIN", "name": "Ciprofloxacin"},
+            {"code": "MED-PARACETAMOL", "name": "Paracetamol"}
+        ])
+    
+    # For discoloration - FIXED REGEX
+    if re.search(r'urin[ei].*color|orange.*urin[ei]|yellow', chief_complaints, re.IGNORECASE):
+        base_medications.append({"code": "MED-URICALM", "name": "Uricalm"})
+    
+    # For irritation/pain - FIXED REGEX
+    if re.search(r'pain|burn[ing]', chief_complaints, re.IGNORECASE):
+        base_medications.append({"code": "MED-IBUPROFEN", "name": "Ibuprofen"})
+    
+    # Always ensure adequate hydration
+    base_medications.append({"code": "MED-AQ", "name": "Aquarius"})
+    
+    # Ensure we don't have duplicate medications
+    unique_medications = []
+    seen = set()
+    for med in base_medications:
+        if med["name"].lower() not in seen:
+            seen.add(med["name"].lower())
+            unique_medications.append(med)
+    
+    return unique_medications
+
+def get_urinary_diet_instructions(chief_complaints):
+    """Return appropriate diet instructions for urinary tract symptoms"""
+    instructions = "Increase fluid intake, drink cranberry juice, avoid caffeine and alcohol, consume vitamin C rich foods"
+    
+    # Add more specific instructions based on symptoms - FIXED REGEX
+    if re.search(r'color|orange|yellow', chief_complaints, re.IGNORECASE):
+        instructions = "Increase fluid intake, avoid processed foods and artificial colors, consume more fruits and vegetables"
+    
+    return [{"text": instructions}]
 
 @app.route('/api/suggest', methods=['POST'])
 def suggest():
