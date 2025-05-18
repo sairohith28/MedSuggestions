@@ -94,6 +94,7 @@ class ClinicalNoteExtractor:
         # Extract the sections in parallel
         result["vitals"] = self._extract_vitals(clinical_note)
         result["chief_complaints"] = self._extract_chief_complaints(clinical_note)
+        result["observations"] = self._extract_observations(clinical_note)  # Extract observations
         result["current_medications"] = self._extract_current_medications(clinical_note)
         result["allergies"] = self._extract_allergies(clinical_note)
         result["medical_history"] = self._extract_medical_history(clinical_note)
@@ -104,6 +105,12 @@ class ClinicalNoteExtractor:
         result["medications"] = self._extract_medications(clinical_note)
         result["diet_instructions"] = self._extract_diet_instructions(clinical_note)
         result["followup"] = self._extract_followup(clinical_note)
+        
+        # Explicitly set observations in the result
+
+        
+        # Log the extracted observations for debugging
+        logger.info(f"Extracted observations: {result['observations']}")
         
         logger.info("Completed extraction of clinical note")
         return result
@@ -651,6 +658,56 @@ Clinical note:
             logger.error(f"Error extracting followup: {str(e)}")
             return {"text": "", "date": ""}
     
+    def _extract_observations(self, text: str) -> str:
+        """Extract physician's observations and physical examination findings from clinical notes"""
+        prompt = f"""Extract ONLY the physician's observations and physical examination findings from the clinical note.
+
+Focus specifically on:
+1. Physical examination findings
+2. Objective clinical observations
+3. Results of the doctor's direct examination of the patient
+4. Descriptions of visible symptoms, signs, or abnormalities
+5. Auscultation, palpation, or percussion findings
+
+INCLUDE:
+- Statements that start with phrases like "on examination", "examination reveals", "found", "observed", "auscultation revealed"
+- Descriptions of physical appearance, rashes, swelling, sounds, etc.
+- Descriptions of vital measurements taken directly by the physician
+- Organ system examination findings (cardiac, respiratory, abdominal, neurological, etc.)
+
+DO NOT INCLUDE:
+- Chief complaints or symptoms reported by the patient
+- Medical history
+- Family history
+- Diagnoses or impressions
+- Treatment plans or prescriptions
+- Lab results or other investigations
+- Medications
+
+Return ONLY the objective findings and observations as a single text string with the original formatting preserved.
+If no observations are found, return an empty string without any explanation.
+
+Clinical note:
+{text}
+"""
+        try:
+            response = self.llm_client.extract("observations", prompt)
+            # Remove filler statements like "No observations mentioned"
+            # if "no " in response.lower() and ("mentioned" in response.lower() or "found" in response.lower() or "provided" in response.lower() or "observations" in response.lower()):
+            #     return ""
+            
+            # Further clean up the response to ensure we're only getting observation data
+            # Remove introductory phrases that aren't part of the actual observations
+            cleaned_response = re.sub(r'^(Observations:|Physical Examination:|Examination Findings:|The physician observed:|On examination,?|Examination revealed:?)\s*', '', response, flags=re.IGNORECASE)
+            
+            # Remove concluding statements that aren't part of the observations
+            cleaned_response = re.sub(r'(Based on these findings.*?|These observations suggest.*?|Overall,.*?)$', '', cleaned_response, flags=re.IGNORECASE)
+            
+            return cleaned_response.strip()
+        except Exception as e:
+            logger.error(f"Error extracting observations: {str(e)}")
+            return ""
+    
     def _get_empty_template(self) -> Dict[str, Any]:
         """Returns an empty template for extraction results"""
         return {
@@ -674,7 +731,8 @@ Clinical note:
             "diagnosis": [{"code": "", "name": ""}],
             "medications": [{"code": "", "name": "", "instructions": ""}],
             "diet_instructions": "",
-            "followup": {"text": "", "date": ""}
+            "followup": {"text": "", "date": ""},
+            "observations": ""  # New observations field
         }
 
 # Create an instance of the extractor
@@ -707,4 +765,4 @@ def extract_note():
         }), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5001, debug=True)
