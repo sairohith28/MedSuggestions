@@ -25,10 +25,10 @@ MONGO_URI = os.getenv("MONGO_URI")
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client["chatbot_dev"]
 patient_visits_collection = db["patient-visits"]
-allergies_collection = db["masterallergies"]
-medications_collection = db["medications"]
-drug_interactions_collection = db["drug-interactions"]
-investigations_collection = db["investigations"]
+# allergies_collection = db["masterallergies"]
+# medications_collection = db["medications"]
+# drug_interactions_collection = db["drug-interactions"]
+# investigations_collection = db["investigations"]
 
 # LLM API endpoint and authorization
 LLM_API_URL = os.getenv("UNSLOTH_API_URL")
@@ -201,7 +201,7 @@ def fetch_patient_history(patient_id, branchId, organizationId):
     "organizationId": ObjectId(organizationId),
     "branchId": branchId
 }).sort("createdAt", -1).limit(10))
-        print("Fetched visits:", visits)
+        # print("Fetched visits:", visits)
         return visits
     except Exception as e:
         logger.error(f"Error fetching patient history: {str(e)}")
@@ -221,7 +221,7 @@ def fetch_doctor_preferences(doctor_id, chief_complaints, branchId, organization
 }
 ).sort("createdAt", -1).limit(10)
         doctor_visits = list(visits)
-        print("Fetched doctor visits:", doctor_visits)
+        # print("Fetched doctor visits:", doctor_visits)
         preferences = {
             "diagnosis": [], 
             "investigations": [], 
